@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AdmiralsPanel</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="app.css">
+</head>
+<body class="bg-ink text-cream min-h-screen font-sans">
+
+<!-- Auth banner: shown when API returns 401 -->
+<div id="auth-banner" class="hidden bg-red-900/60 border-b border-red-700 px-6 py-3 text-center">
+    You are not logged in.
+    <a href="/login" class="underline text-gold font-semibold">Log in to the WindrosePlus dashboard</a>,
+    then return to this page.
+</div>
+
+<!-- Top bar -->
+<header class="border-b border-gold/30 bg-black/40 px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+        <span class="text-2xl">⚓</span>
+        <h1 class="text-xl font-bold tracking-wide text-gold">AdmiralsPanel</h1>
+        <span class="text-xs text-cream/50" id="app-version">v0.1.0</span>
+    </div>
+    <div class="flex items-center gap-4 text-sm">
+        <span id="status-dot" class="w-2 h-2 rounded-full bg-gold/60" title="polling"></span>
+        <span id="player-count">- players</span>
+        <span class="text-cream/40">&bull;</span>
+        <span id="server-version">-</span>
+        <span class="text-cream/40">&bull;</span>
+        <span id="uptime">-</span>
+    </div>
+</header>
+
+<div class="flex">
+    <!-- Sidebar -->
+    <nav class="w-44 border-r border-gold/20 min-h-[calc(100vh-57px)] py-4">
+        <button data-tab="players" class="tab-btn tab-active">Players</button>
+        <button data-tab="world" class="tab-btn">World</button>
+        <button data-tab="presets" class="tab-btn">Presets</button>
+        <button data-tab="announce" class="tab-btn">Announce</button>
+        <button data-tab="server" class="tab-btn">Server</button>
+        <button data-tab="console" class="tab-btn">Console</button>
+        <div class="mt-8 px-4 text-xs text-cream/40">
+            <a href="/" class="underline hover:text-gold">&larr; Back to WP dashboard</a>
+        </div>
+    </nav>
+
+    <!-- Main content -->
+    <main class="flex-1 p-6">
+
+        <!-- Players -->
+        <section id="tab-players" class="tab-panel">
+            <h2 class="tab-heading">Online players</h2>
+            <p class="text-sm text-cream/60 mb-4">Speed slider applies live via <code>wp.speed</code>. Changes debounce 500ms.</p>
+            <div id="players-empty" class="text-cream/50 italic py-8">No players online.</div>
+            <table id="players-table" class="hidden w-full text-left">
+                <thead class="border-b border-gold/30 text-sm text-cream/60">
+                    <tr>
+                        <th class="py-2">Name</th>
+                        <th class="py-2">Position</th>
+                        <th class="py-2 w-72">Speed</th>
+                        <th class="py-2"></th>
+                    </tr>
+                </thead>
+                <tbody id="players-tbody"></tbody>
+            </table>
+        </section>
+
+        <!-- World multipliers -->
+        <section id="tab-world" class="tab-panel hidden">
+            <h2 class="tab-heading">World multipliers</h2>
+            <p class="text-sm text-cream/60 mb-4">
+                Applies live where the engine supports it; always persists to <code>windrose_plus.json</code>.
+                Some multipliers may require a server restart to take effect.
+            </p>
+            <div id="multipliers-grid" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
+        </section>
+
+        <!-- Presets -->
+        <section id="tab-presets" class="tab-panel hidden">
+            <h2 class="tab-heading">Presets</h2>
+            <p class="text-sm text-cream/60 mb-4">
+                Click a card to apply the multiplier bundle. Event presets only change the listed multipliers; others keep their current values.
+            </p>
+            <div id="presets-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
+        </section>
+
+        <!-- Announce -->
+        <section id="tab-announce" class="tab-panel hidden">
+            <h2 class="tab-heading">Announce</h2>
+            <p class="text-sm text-cream/60 mb-4">
+                Writes to server log and <code>events.log</code>.
+                In-game chat broadcast requires a future C++ companion mod
+                (<a href="https://github.com/Mancavegaming/admiral-admin/blob/main/docs/roadmap.md" class="underline text-gold">roadmap</a>).
+            </p>
+            <form id="announce-form" class="flex gap-2">
+                <input id="announce-input" type="text" placeholder="Message..." maxlength="500"
+                       class="flex-1 bg-ink-light border border-gold/30 rounded px-3 py-2 focus:outline-none focus:border-gold">
+                <button type="submit" class="btn-primary">Send</button>
+            </form>
+            <h3 class="mt-8 mb-2 text-cream/70 text-sm uppercase tracking-wider">Recent</h3>
+            <div id="announce-log" class="space-y-2 text-sm"></div>
+        </section>
+
+        <!-- Server info -->
+        <section id="tab-server" class="tab-panel hidden">
+            <h2 class="tab-heading">Server</h2>
+            <div class="grid grid-cols-2 gap-4 text-sm">
+                <div class="info-card">
+                    <div class="info-label">Server Name</div>
+                    <div id="srv-name" class="info-value">-</div>
+                </div>
+                <div class="info-card">
+                    <div class="info-label">Game Version</div>
+                    <div id="srv-gameversion" class="info-value">-</div>
+                </div>
+                <div class="info-card">
+                    <div class="info-label">WindrosePlus</div>
+                    <div id="srv-wpversion" class="info-value">-</div>
+                </div>
+                <div class="info-card">
+                    <div class="info-label">Invite Code</div>
+                    <div id="srv-invite" class="info-value">-</div>
+                </div>
+                <div class="info-card">
+                    <div class="info-label">Players</div>
+                    <div id="srv-players" class="info-value">-</div>
+                </div>
+                <div class="info-card">
+                    <div class="info-label">Uptime</div>
+                    <div id="srv-uptime" class="info-value">-</div>
+                </div>
+            </div>
+            <h3 class="mt-8 mb-2 text-cream/70 text-sm uppercase tracking-wider">Recent admin actions</h3>
+            <div id="adminlog-list" class="text-sm font-mono bg-ink-light border border-gold/20 rounded p-3 max-h-64 overflow-y-auto whitespace-pre-wrap"></div>
+        </section>
+
+        <!-- Console -->
+        <section id="tab-console" class="tab-panel hidden">
+            <h2 class="tab-heading">Console</h2>
+            <p class="text-sm text-cream/60 mb-4">
+                Raw RCON. Any <code>wp.*</code> or <code>ap.*</code> command. Press Enter to send.
+            </p>
+            <form id="console-form" class="flex gap-2 mb-4">
+                <span class="text-gold font-mono py-2">&gt;</span>
+                <input id="console-input" type="text" placeholder="wp.help" autocomplete="off"
+                       class="flex-1 bg-ink-light border border-gold/30 rounded px-3 py-2 font-mono focus:outline-none focus:border-gold">
+                <button type="submit" class="btn-primary">Run</button>
+            </form>
+            <div id="console-output" class="bg-ink-light border border-gold/20 rounded p-3 font-mono text-sm max-h-[60vh] overflow-y-auto whitespace-pre-wrap"></div>
+        </section>
+
+    </main>
+</div>
+
+<!-- Toast notifications -->
+<div id="toast-stack" class="fixed bottom-6 right-6 space-y-2 z-50"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

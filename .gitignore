@@ -1,0 +1,23 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local scratch / test output
+/tmp/
+*.log
+*.bak
+
+# Build artefacts (none expected — no build step — but future-proof)
+dist/
+build/
+node_modules/
+
+# Release zips created by CI (kept out of repo)
+admiral-admin-*.zip

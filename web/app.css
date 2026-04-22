@@ -1,0 +1,167 @@
+/* AdmiralsPanel custom styles — sits on top of Tailwind CDN.
+   Nautical aged-paper theme, matched to WindrosePlus dashboard. */
+
+:root {
+    --ink: #1a130e;
+    --ink-light: #2a1f16;
+    --cream: #ede0cc;
+    --gold: #d4a04a;
+    --gold-soft: rgba(212, 160, 74, 0.2);
+}
+
+body { background: var(--ink); color: var(--cream); }
+
+/* Tailwind color aliases (via @apply-equivalent). Simpler: inline vars. */
+.bg-ink        { background-color: var(--ink); }
+.bg-ink-light  { background-color: var(--ink-light); }
+.text-cream    { color: var(--cream); }
+.text-gold     { color: var(--gold); }
+.border-gold\/30 { border-color: rgba(212, 160, 74, 0.3); }
+.border-gold\/20 { border-color: rgba(212, 160, 74, 0.2); }
+
+/* Tab buttons */
+.tab-btn {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 10px 20px;
+    color: var(--cream);
+    opacity: 0.7;
+    border-left: 3px solid transparent;
+    transition: all 150ms ease;
+    cursor: pointer;
+    background: none;
+    border-top: none;
+    border-right: none;
+    border-bottom: none;
+}
+.tab-btn:hover {
+    opacity: 1;
+    background: rgba(212, 160, 74, 0.08);
+}
+.tab-btn.tab-active {
+    opacity: 1;
+    border-left-color: var(--gold);
+    color: var(--gold);
+    background: rgba(212, 160, 74, 0.12);
+}
+
+.tab-heading {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--gold);
+    margin-bottom: 0.5rem;
+    border-bottom: 1px solid rgba(212, 160, 74, 0.3);
+    padding-bottom: 0.5rem;
+}
+
+/* Multiplier card */
+.mult-card {
+    background: var(--ink-light);
+    border: 1px solid rgba(212, 160, 74, 0.25);
+    border-radius: 6px;
+    padding: 14px 16px;
+}
+.mult-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 8px;
+}
+.mult-title  { font-weight: 600; }
+.mult-value  {
+    font-family: ui-monospace, monospace;
+    color: var(--gold);
+    font-size: 1.1rem;
+}
+.mult-desc   { font-size: 0.75rem; color: rgba(237, 224, 204, 0.55); margin-top: 4px; }
+.mult-slider {
+    width: 100%;
+    accent-color: var(--gold);
+}
+
+/* Preset card */
+.preset-card {
+    background: var(--ink-light);
+    border: 1px solid rgba(212, 160, 74, 0.25);
+    border-radius: 6px;
+    padding: 16px;
+    cursor: pointer;
+    transition: border-color 150ms ease, transform 100ms ease;
+}
+.preset-card:hover {
+    border-color: var(--gold);
+    transform: translateY(-1px);
+}
+.preset-card.applying { opacity: 0.5; pointer-events: none; }
+.preset-title { font-size: 1.1rem; font-weight: 700; color: var(--gold); }
+.preset-desc  { font-size: 0.875rem; color: rgba(237, 224, 204, 0.7); margin-top: 6px; }
+.preset-meta  {
+    margin-top: 10px;
+    font-size: 0.7rem;
+    color: rgba(237, 224, 204, 0.5);
+    font-family: ui-monospace, monospace;
+}
+
+/* Info card (server tab) */
+.info-card {
+    background: var(--ink-light);
+    border: 1px solid rgba(212, 160, 74, 0.2);
+    border-radius: 6px;
+    padding: 12px 16px;
+}
+.info-label { font-size: 0.7rem; color: rgba(237, 224, 204, 0.55); text-transform: uppercase; letter-spacing: 0.08em; }
+.info-value { font-size: 1.1rem; margin-top: 4px; color: var(--gold); font-family: ui-monospace, monospace; }
+
+/* Primary button */
+.btn-primary {
+    background: var(--gold);
+    color: var(--ink);
+    border: none;
+    border-radius: 4px;
+    padding: 8px 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 120ms ease;
+}
+.btn-primary:hover { opacity: 0.85; }
+.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Player speed slider row */
+.player-row td {
+    border-bottom: 1px solid rgba(212, 160, 74, 0.1);
+    padding: 10px 4px;
+    vertical-align: middle;
+}
+.player-row:last-child td { border-bottom: none; }
+
+/* Toast */
+.toast {
+    padding: 10px 16px;
+    border-radius: 4px;
+    max-width: 400px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    animation: toast-in 200ms ease-out;
+}
+.toast.ok    { background: #1d3a1d; border: 1px solid #2e5c2e; color: #c4e8c4; }
+.toast.err   { background: #3a1d1d; border: 1px solid #5c2e2e; color: #e8c4c4; }
+.toast.info  { background: var(--ink-light); border: 1px solid var(--gold-soft); color: var(--cream); }
+@keyframes toast-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Status dot */
+#status-dot.dot-live { background: #2aab6f; box-shadow: 0 0 8px rgba(42, 171, 111, 0.7); }
+#status-dot.dot-stale { background: #c77a1a; }
+#status-dot.dot-dead { background: #c4404a; }
+
+/* Console output line styling */
+.console-entry {
+    padding: 6px 0;
+    border-bottom: 1px dashed rgba(212, 160, 74, 0.15);
+}
+.console-entry:last-child { border-bottom: none; }
+.console-cmd { color: var(--gold); }
+.console-resp { color: var(--cream); white-space: pre-wrap; }
+.console-err { color: #e8a0a0; }
