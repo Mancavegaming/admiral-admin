@@ -9,6 +9,7 @@
 // ---------------------------------------------------------------------------
 
 const POLL_INTERVAL_MS = 3000;
+const POLL_STATS_MS = 2000;
 const ADMIN_LOG_POLL_MS = 15000;
 const SPEED_DEBOUNCE_MS = 500;
 const MULT_DEBOUNCE_MS = 500;
@@ -109,6 +110,9 @@ const state = {
     muted401: false,    // don't spam the auth banner
     multDebounce: {},   // key -> timeoutId
     speedDebounce: {},  // player name -> timeoutId
+    playerStats: {},    // name -> {Health, MaxHealth, Stamina, ...} from ap.allstatsn
+    statsWarned: false, // whether we've warned the user that DLL is missing
+    playersKey: "",     // comma-joined sorted player names last rendered in table
 };
 
 // ---------------------------------------------------------------------------
@@ -172,6 +176,56 @@ async function pollStatus() {
         setStatusDot("dot-live");
     } catch (e) {
         setStatusDot("dot-dead");
+    }
+}
+
+async function pollStats() {
+    // Only bother if there are online players
+    const players = (state.status && state.status.players) || [];
+    if (players.length === 0) return;
+    const res = await rcon("ap.allstatsn");
+    if (!res || res.status !== "ok") return;
+    const msg = String(res.message || "");
+    // If native DLL isn't loaded, we get the "Native feature unavailable" message.
+    if (msg.indexOf("Native feature unavailable") >= 0) {
+        if (!state.statsWarned) {
+            state.statsWarned = true;
+            toast("Stat bars require AdmiralsPanelNative.dll (not installed)", "info");
+        }
+        return;
+    }
+    try {
+        state.playerStats = JSON.parse(msg);
+        applyStatBars();
+    } catch (e) {
+        // Don't spam - silently ignore parse errors (different DLL version etc.)
+    }
+}
+
+function applyStatBars() {
+    const pairs = [
+        ["Health",  "MaxHealth",  "hp"],
+        ["Stamina", "MaxStamina", "sta"],
+        ["Posture", "MaxPosture", "pst"],
+    ];
+    for (const name in state.playerStats) {
+        const stats = state.playerStats[name];
+        const nm = cssSafe(name);
+        for (const [cur, max, slug] of pairs) {
+            const c = stats[cur];
+            const m = stats[max];
+            const fill = document.getElementById(`stat-fill-${slug}-${nm}`);
+            const val = document.getElementById(`stat-val-${slug}-${nm}`);
+            if (!fill || !val) continue;
+            if (c === undefined || m === undefined || m <= 0) {
+                val.textContent = "—";
+                fill.style.width = "0%";
+                continue;
+            }
+            const pct = Math.max(0, Math.min(100, (c / m) * 100));
+            fill.style.width = `${pct}%`;
+            val.textContent = `${Math.round(c)}/${Math.round(m)}`;
+        }
     }
 }
 
@@ -254,51 +308,79 @@ function renderPlayers() {
     if (players.length === 0) {
         empty.classList.remove("hidden");
         table.classList.add("hidden");
+        state.playersKey = "";
         return;
     }
     empty.classList.add("hidden");
     table.classList.remove("hidden");
 
-    tbody.innerHTML = "";
-    for (const p of players) {
-        const tr = document.createElement("tr");
-        tr.className = "player-row";
-        const pos = (p.x !== undefined) ? `${Math.round(p.x)}, ${Math.round(p.y)}, ${Math.round(p.z)}` : "-";
-        // Build TP dropdown: other players only
-        const tpOptions = players
-            .filter(o => o.name !== p.name)
-            .map(o => `<option value="${esc(o.name)}">${esc(o.name)}</option>`)
-            .join("");
-        tr.innerHTML = `
-            <td class="font-semibold text-gold">${esc(p.name)}</td>
-            <td class="font-mono text-xs text-cream/70">${pos}</td>
-            <td>
-                <div class="flex items-center gap-2">
-                    <input type="range" min="0.2" max="5" step="0.1" value="1"
-                           class="flex-1 mult-slider" data-player="${esc(p.name)}">
-                    <span class="mult-value text-xs" id="speed-val-${cssSafe(p.name)}">1.0×</span>
-                    <button class="row-btn" data-reset-speed="${esc(p.name)}" title="Reset speed to 1×">↺</button>
-                </div>
-            </td>
-            <td>
-                <div class="flex flex-wrap gap-1">
-                    <button class="row-btn row-btn-heal"   data-heal="${esc(p.name)}">Heal</button>
-                    <button class="row-btn row-btn-feed"   data-feed="${esc(p.name)}">Feed</button>
-                    <button class="row-btn row-btn-revive" data-revive="${esc(p.name)}">Revive</button>
-                    <button class="row-btn row-btn-kill"   data-kill="${esc(p.name)}">Kill</button>
-                </div>
-            </td>
-            <td>
-                <div class="flex gap-1">
-                    <select class="row-select" data-tp-src="${esc(p.name)}">
-                        <option value="">pick target…</option>
-                        ${tpOptions}
-                    </select>
-                    <button class="row-btn" data-tp-go="${esc(p.name)}">TP</button>
-                </div>
-            </td>
-        `;
-        tbody.appendChild(tr);
+    const key = players.map(p => p.name).sort().join(",");
+    const needsRebuild = key !== state.playersKey;
+
+    if (needsRebuild) {
+        tbody.innerHTML = "";
+        for (const p of players) {
+            const tr = document.createElement("tr");
+            tr.className = "player-row";
+            const pos = (p.x !== undefined) ? `${Math.round(p.x)}, ${Math.round(p.y)}, ${Math.round(p.z)}` : "-";
+            const tpOptions = players
+                .filter(o => o.name !== p.name)
+                .map(o => `<option value="${esc(o.name)}">${esc(o.name)}</option>`)
+                .join("");
+            const nm = cssSafe(p.name);
+            tr.innerHTML = `
+                <td class="font-semibold text-gold">${esc(p.name)}</td>
+                <td>
+                    <div class="player-stats">
+                        <div class="stat-line"><span class="stat-tag">HP</span><div class="stat-bar"><div id="stat-fill-hp-${nm}"  class="stat-fill stat-fill-hp"></div></div><span id="stat-val-hp-${nm}"  class="stat-val">—</span></div>
+                        <div class="stat-line"><span class="stat-tag">ST</span><div class="stat-bar"><div id="stat-fill-sta-${nm}" class="stat-fill stat-fill-sta"></div></div><span id="stat-val-sta-${nm}" class="stat-val">—</span></div>
+                        <div class="stat-line"><span class="stat-tag">PS</span><div class="stat-bar"><div id="stat-fill-pst-${nm}" class="stat-fill stat-fill-pst"></div></div><span id="stat-val-pst-${nm}" class="stat-val">—</span></div>
+                    </div>
+                </td>
+                <td id="pos-${nm}" class="font-mono text-xs text-cream/70">${pos}</td>
+                <td>
+                    <div class="flex items-center gap-2">
+                        <input type="range" min="0.2" max="5" step="0.1" value="1"
+                               class="flex-1 mult-slider" data-player="${esc(p.name)}">
+                        <span class="mult-value text-xs" id="speed-val-${nm}">1.0×</span>
+                        <button class="row-btn" data-reset-speed="${esc(p.name)}" title="Reset speed to 1×">↺</button>
+                    </div>
+                </td>
+                <td>
+                    <div class="flex flex-wrap gap-1">
+                        <button class="row-btn row-btn-heal"   data-heal="${esc(p.name)}">Heal</button>
+                        <button class="row-btn row-btn-feed"   data-feed="${esc(p.name)}">Feed</button>
+                        <button class="row-btn row-btn-revive" data-revive="${esc(p.name)}">Revive</button>
+                        <button class="row-btn row-btn-kill"   data-kill="${esc(p.name)}">Kill</button>
+                    </div>
+                </td>
+                <td>
+                    <div class="flex gap-1">
+                        <select class="row-select" data-tp-src="${esc(p.name)}">
+                            <option value="">pick target…</option>
+                            ${tpOptions}
+                        </select>
+                        <button class="row-btn" data-tp-go="${esc(p.name)}">TP</button>
+                    </div>
+                </td>
+            `;
+            tbody.appendChild(tr);
+        }
+        state.playersKey = key;
+    } else {
+        // Player set unchanged — just update the one mutable field we show (position)
+        for (const p of players) {
+            const nm = cssSafe(p.name);
+            const posEl = document.getElementById(`pos-${nm}`);
+            if (posEl) {
+                posEl.textContent = (p.x !== undefined)
+                    ? `${Math.round(p.x)}, ${Math.round(p.y)}, ${Math.round(p.z)}`
+                    : "-";
+            }
+        }
+        // Re-apply last known stat bar values so they don't reset visually
+        applyStatBars();
+        return;
     }
 
     // Speed slider
@@ -336,6 +418,9 @@ function renderPlayers() {
             runNative(`ap.tp ${src} ${dst}`, `TP ${src} → ${dst}`, b);
         });
     });
+
+    // Immediately paint bars with the last-known stats so rebuilds don't flash to 0.
+    applyStatBars();
 }
 
 // Run an RCON command, flash the triggering button, surface result via toast.
@@ -658,4 +743,5 @@ document.addEventListener("DOMContentLoaded", () => {
 
     pollStatus();
     setInterval(pollStatus, POLL_INTERVAL_MS);
+    setInterval(pollStats, POLL_STATS_MS);
 });

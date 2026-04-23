@@ -95,7 +95,46 @@ If a Windrose patch breaks it: run `ap.inspectn <player>` with an updated inspec
 
 ## Roadmap additions
 
-- **Give item**: need to find where inventory slots live. `R5Character.Equipment` (TObjectPtr<UR5PlayerEquipment>) is probably the entry point; inspector output will reveal layout.
-- **Chat broadcast**: RPC via `ClientMessage` crashes UE4SS-Lua. From C++ it may work but needs careful argument marshalling. Alternatively find a server-side broadcast function that isn't an RPC.
-- **Posture / RangeWeapon attributes**: wire up second + third attribute sets using the same pattern.
-- **Mob admin**: apply all of the above to non-player AActors. Same AttributeSet layout likely applies.
+### Give-item (deferred — architecture notes)
+
+Extensive reverse-eng was done in v0.3 preparing the ground. Findings:
+
+- Windrose inventory is **rule-based**. Actual storage lives in a central
+  subsystem (not exposed), accessed via rule classes in `R5BusinessRules`:
+  `R5BLInventory_AddItemsRule`, `R5BLInventory_ActionMoveItemsRule`,
+  `R5BLInventoryCheat_ClearInventoryRule`, and ~30 more.
+- `R5Character.Equipment` / `ProximityStorageComponent` / `AmmoComponent`
+  all hold `UR5BLInventoryView` — a **thin handle**, zero own properties.
+  Storage is elsewhere.
+- Rule classes themselves have **zero reflected UPROPERTY fields** (probed
+  via `ap.classprobe R5BLInventory_AddItemsRule`). Parameters pass through
+  UFunction args, which aren't currently enumerable from our probe.
+- `R5AMTask_SpawnActor` + `R5AMTaskParams_SpawnActor` exist and could spawn
+  an item actor in the world near the player (player picks up naturally).
+  Requires: (1) finding the ActionManager subsystem, (2) constructing
+  `R5AMTaskParams_SpawnActor` with correct fields, (3) knowing the item
+  class path (e.g. `/Game/Items/Food/BP_Bread.BP_Bread_C`).
+- `CheatManager` and `CheatManagerExtension` exist (engine defaults) but
+  no obvious R5-registered give-item cheat. `GameFeatureAction_AddCheats`
+  is present — Windrose may register cheats conditionally via GameFeatures,
+  so the visible class list may be incomplete.
+- **UE4SS object dumper** (Ctrl+J on client) would reveal every UFunction
+  on every class including param signatures. That's the proper next step
+  for anyone picking this up.
+
+Realistic path: 2-4 more sessions. Alternative: wait for someone to crack
+the rule-dispatch API upstream (Windrose modding community is growing).
+
+### Chat broadcast
+
+RPC via `ClientMessage` crashes UE4SS-Lua argument marshalling. From C++ it
+may work but needs careful `ProcessEvent` with an FString argument
+struct. Alternatively: find a server-side broadcast UFunction (GameMode
+level) that isn't an RPC.
+
+### Mob admin / second attribute sets
+
+Posture and RangeWeapon attribute sets are now reachable via
+`ap.readattrn` / `ap.setattrn` (v0.3.1 walks `ASC.SpawnedAttributes`).
+Extending to mobs (AI characters) follows the same pattern — they have
+their own attribute sets on their `AR5AICharacter` state.

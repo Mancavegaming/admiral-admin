@@ -424,6 +424,9 @@ API.registerCommand("ap.feedn",   nativeWrapper("admiralspanel_native_feed",   n
 API.registerCommand("ap.reviven", nativeWrapper("admiralspanel_native_revive", nil, "ap.reviven"), "Set Health to MaxHealth",     "ap.reviven <player>")
 API.registerCommand("ap.setattrn",nativeWrapper("admiralspanel_native_setattr",nil, "ap.setattrn"),"Set any R5AttributeSet field","ap.setattrn <player> <attr> <value>")
 API.registerCommand("ap.readattrn",nativeWrapper("admiralspanel_native_readattr",nil,"ap.readattrn"),"Read any R5AttributeSet field","ap.readattrn <player> <attr>")
+API.registerCommand("ap.allstatsn",nativeWrapper("admiralspanel_native_allstats",nil,"ap.allstatsn"),"JSON of all players' Health/Stamina/Comfort/Posture","ap.allstatsn")
+API.registerCommand("ap.classprobe",nativeWrapper("admiralspanel_native_classprobe",nil,"ap.classprobe"),"Dump a UClass's properties (reverse-eng tool)","ap.classprobe <ClassName>")
+API.registerCommand("ap.scan",nativeWrapper("admiralspanel_native_scan",nil,"ap.scan"),"Scan loaded UObjects for classes matching substring","ap.scan <substring>")
 API.registerCommand("ap.findn",   nativeWrapper("admiralspanel_native_find",   nil, "ap.findn"),   "Debug: find pawn by name",    "ap.findn <player>")
 API.registerCommand("ap.inspectn",nativeWrapper("admiralspanel_native_inspect",nil, "ap.inspectn"),"Debug: dump object properties","ap.inspectn <player>")
 

@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file. Format is l
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-04-23
+
+### Added
+
+- **Live stat bars** on the Players tab — HP / Stamina / Posture per player,
+  polled every 2s via a new `ap.allstatsn` that batches all online players'
+  attributes into one RCON call.
+- **Multi-set attribute access**: `ap.readattrn` and `ap.setattrn` now walk
+  `ASC.SpawnedAttributes` to find whichever set has the attribute (previously
+  only checked `R5AttributeSet`). So you can now read/write Posture,
+  Comfort, RangeWeapon attributes through the normal commands. Output also
+  tells you which set the value was found on (e.g.
+  `Comfort [on R5ComfortAttributeSet]: current=1 base=0`).
+- **`ap.classprobe` / `ap.scan`** — reverse-engineering helpers for future
+  work. Dumps a UClass's properties or scans all loaded UObjects for
+  classes matching a substring.
+
+### Changed
+
+- `ap.feedn` no longer refills Comfort. On Windrose the Comfort attribute
+  is tracked but doesn't drive the visible comfort/hunger UI (derived
+  client-side from inventory/shelter/warmth) — setting it had no effect
+  so we dropped it from the refill list to avoid confusion.
+- Players tab row UI: fixed a flash-and-reset bug where the stat bars
+  would momentarily empty on every status poll. Now the table only
+  rebuilds when the player set changes; stats update in place.
+
+### Documentation
+
+- `docs/native-mod.md` gained a detailed "Give-item deferred" section
+  with the full research trail: rule-based inventory architecture,
+  findings from `R5BLInventory_AddItemsRule` / `R5AMTask_SpawnActor`, and
+  the realistic path forward for anyone picking it up.
+
 ## [0.3.0] — 2026-04-23
 
 ### Added

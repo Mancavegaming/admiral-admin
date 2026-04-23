@@ -161,6 +161,52 @@ body { background: var(--ink); color: var(--cream); }
 }
 .row-select:focus { outline: none; border-color: var(--gold); }
 
+/* Per-row stat bars (HP / Stamina / Comfort / Posture) */
+.player-stats {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+.stat-line {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.7rem;
+    font-family: ui-monospace, monospace;
+}
+.stat-tag {
+    width: 20px;
+    color: var(--cream);
+    opacity: 0.55;
+    text-align: right;
+    font-weight: 600;
+}
+.stat-bar {
+    flex: 1;
+    height: 7px;
+    background: rgba(0, 0, 0, 0.4);
+    border: 1px solid rgba(212, 160, 74, 0.15);
+    border-radius: 3px;
+    overflow: hidden;
+    min-width: 80px;
+}
+.stat-fill {
+    height: 100%;
+    width: 0%;
+    transition: width 200ms ease-out;
+    border-radius: 2px;
+}
+.stat-fill-hp  { background: linear-gradient(90deg, #c4404a 0%, #e06b75 100%); }
+.stat-fill-sta { background: linear-gradient(90deg, #c8a05a 0%, #e8cba0 100%); }
+.stat-fill-cmf { background: linear-gradient(90deg, #5ab482 0%, #9fdbb6 100%); }
+.stat-fill-pst { background: linear-gradient(90deg, #8cb4dc 0%, #b8d4ed 100%); }
+.stat-val {
+    min-width: 55px;
+    color: var(--cream);
+    opacity: 0.85;
+    text-align: right;
+}
+
 /* Player speed slider row */
 .player-row td {
     border-bottom: 1px solid rgba(212, 160, 74, 0.1);
