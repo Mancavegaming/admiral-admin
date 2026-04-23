@@ -27,6 +27,67 @@ const MULTIPLIERS = [
     { key: "harvest_yield",   label: "Harvest yield",      desc: "Harvest yield multiplier", min: 0.1, max: 10, step: 0.1 },
 ];
 
+// Known R5AttributeSet fields (from ap.inspectn dump). Grouped for UX.
+const ATTRIBUTE_GROUPS = [
+    { label: "Survival", attrs: [
+        "Health", "MaxHealth", "TemporalHealth", "PassiveHealthRegen",
+        "Stamina", "MaxStamina", "StaminaRegenRate",
+        "Comfort", "MaxComfort",
+        "Posture", "MaxPosture", "PostureRegenRate",
+    ]},
+    { label: "Combat — base", attrs: [
+        "Damage", "Heal", "HealDoneModifier", "HealTakenModifier",
+        "Armor", "ArmorModifier", "ArmorPenalty",
+        "ArmorPenetrationFlatModifier", "ArmorPenetrationPercentModifier",
+        "FinalDamageReductionByArmor",
+        "CriticalChanceBase", "CriticalChanceModifier",
+        "CriticalDamageDoneModifier", "CriticalDamageTakenResist",
+        "DefencePower", "DefencePowerRaw",
+        "MainScalingDamageModifier", "SecondaryScalingDamageModifier",
+    ]},
+    { label: "Stamina — advanced", attrs: [
+        "StaminaRegenRateModifier", "StaminaConsumptionModifier",
+        "StaminaConsumptionMeleeModifier", "StaminaConsumptionMoveActionModifier",
+    ]},
+    { label: "Damage done (all types)", attrs: [
+        "GlobalDamageDoneAdded", "GlobalDamageDoneModifier", "GlobalDamageDonePenalty",
+        "MeleeDamageDoneAdded", "MeleeDamageDoneModifier", "MeleeDamageDonePenalty",
+        "RangeDamageDoneAdded", "RangeDamageDoneModifier", "RangeDamageDonePenalty",
+        "CannonDamageDoneAdded", "CannonDamageDoneModifier", "CannonDamageDonePenalty",
+        "BluntDamageDoneAdded", "BluntDamageDoneModifier", "BluntDamageDonePenalty",
+        "SlashDamageDoneAdded", "SlashDamageDoneModifier", "SlashDamageDonePenalty",
+        "PierceDamageDoneAdded", "PierceDamageDoneModifier", "PierceDamageDonePenalty",
+        "FireDamageDoneAdded", "FireDamageDoneModifier", "FireDamageDonePenalty",
+        "PoisonDamageDoneAdded", "PoisonDamageDoneModifier", "PoisonDamageDonePenalty",
+        "CursedDamageDoneAdded", "CursedDamageDoneModifier", "CursedDamageDonePenalty",
+        "CorruptDamageDoneAdded", "CorruptDamageDoneModifier", "CorruptDamageDonePenalty",
+        "HolyDamageDoneAdded", "HolyDamageDoneModifier", "HolyDamageDonePenalty",
+        "CrudeDamageDoneAdded", "CrudeDamageDoneModifier", "CrudeDamageDonePenalty",
+        "BleedDamageDoneAdded", "BleedDamageDoneModifier", "BleedDamageDonePenalty",
+    ]},
+    { label: "Damage taken — resist / weakness / block", attrs: [
+        "GlobalDamageTakenResist", "GlobalDamageTakenWeakness", "GlobalDamageTakenBlockEffectiveness",
+        "MeleeDamageTakenResist", "MeleeDamageTakenWeakness", "MeleeDamageTakenBlockEffectiveness",
+        "RangeDamageTakenResist", "RangeDamageTakenWeakness", "RangeDamageTakenBlockEffectiveness",
+        "CannonDamageTakenResist", "CannonDamageTakenWeakness", "CannonDamageTakenBlockEffectiveness",
+        "BluntDamageTakenResist", "BluntDamageTakenWeakness", "BluntDamageTakenBlockEffectiveness",
+        "SlashDamageTakenResist", "SlashDamageTakenWeakness", "SlashDamageTakenBlockEffectiveness",
+        "PierceDamageTakenResist", "PierceDamageTakenWeakness", "PierceDamageTakenBlockEffectiveness",
+        "FireDamageTakenResist", "FireDamageTakenWeakness", "FireDamageTakenBlockEffectiveness",
+        "PoisonDamageTakenResist", "PoisonDamageTakenWeakness", "PoisonDamageTakenBlockEffectiveness",
+        "CursedDamageTakenResist", "CursedDamageTakenWeakness", "CursedDamageTakenBlockEffectiveness",
+        "CorruptDamageTakenResist", "CorruptDamageTakenWeakness", "CorruptDamageTakenBlockEffectiveness",
+        "HolyDamageTakenResist", "HolyDamageTakenWeakness", "HolyDamageTakenBlockEffectiveness",
+        "CrudeDamageTakenResist", "CrudeDamageTakenWeakness", "CrudeDamageTakenBlockEffectiveness",
+        "BleedDamageTakenResist", "BleedDamageTakenWeakness", "BleedDamageTakenBlockEffectiveness",
+    ]},
+    { label: "Corruption", attrs: [
+        "CorruptionStatus", "MaxCorruptionStatus", "PassiveCorruptionStatusRegen",
+        "CorruptionStatusBuildupResist", "CorruptionStatusBuildupFlatResist",
+        "CorruptionStatusBuildupResistMax", "CorruptionStatusDamage",
+    ]},
+];
+
 // Must match mod/data/presets.json.
 const PRESETS = [
     { id: "vanilla",     label: "Vanilla",       tag: "Full reset", desc: "All multipliers at 1.0 — Windrose defaults." },
@@ -173,6 +234,7 @@ function renderActiveTab() {
         case "players":  renderPlayers(); break;
         case "world":    renderWorld(); break;
         case "presets":  renderPresets(); break;
+        case "attrs":    renderAttrs(); break;
         case "announce": renderAnnounce(); break;
         case "server":   renderServer(); break;
         case "console":  /* nothing to auto-render */ break;
@@ -372,6 +434,80 @@ function onMultiplierInput(key, sl) {
         if (res && res.status === "ok") toast(`${key} -> ${v}×`, "ok");
         else toast(`Failed: ${res && res.message || "?"}`, "err");
     }, MULT_DEBOUNCE_MS);
+}
+
+// ---------------------------------------------------------------------------
+// Attributes tab
+// ---------------------------------------------------------------------------
+
+let attrsBuilt = false;
+function renderAttrs() {
+    // Refresh the player dropdown every call (players come and go)
+    const playerSelect = document.getElementById("attr-player");
+    if (playerSelect) {
+        const players = (state.status && state.status.players) || [];
+        const prev = playerSelect.value;
+        playerSelect.innerHTML = players.length === 0
+            ? '<option value="">(no player online)</option>'
+            : players.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join("");
+        if (prev && players.some(p => p.name === prev)) playerSelect.value = prev;
+    }
+
+    if (attrsBuilt) return;
+
+    // Populate the attribute select with optgroups
+    const attrSelect = document.getElementById("attr-name");
+    if (attrSelect) {
+        let html = '<option value="">pick an attribute…</option>';
+        for (const g of ATTRIBUTE_GROUPS) {
+            html += `<optgroup label="${esc(g.label)}">`;
+            for (const a of g.attrs) {
+                html += `<option value="${esc(a)}">${esc(a)}</option>`;
+            }
+            html += "</optgroup>";
+        }
+        attrSelect.innerHTML = html;
+    }
+
+    // Wire buttons
+    const readout = document.getElementById("attr-readout");
+    document.getElementById("attr-read").addEventListener("click", async () => {
+        const name = playerSelect.value;
+        const attr = attrSelect.value;
+        if (!name) { readout.textContent = "(pick a player)"; return; }
+        if (!attr) { readout.textContent = "(pick an attribute)"; return; }
+        readout.textContent = "reading…";
+        const res = await rcon(`ap.readattrn ${name} ${attr}`);
+        readout.textContent = (res && res.message) || "(no response)";
+    });
+    document.getElementById("attr-set").addEventListener("click", async () => {
+        const name = playerSelect.value;
+        const attr = attrSelect.value;
+        const val = document.getElementById("attr-value").value;
+        if (!name) { toast("Pick a player", "err"); return; }
+        if (!attr) { toast("Pick an attribute", "err"); return; }
+        if (val === "" || isNaN(parseFloat(val))) { toast("Enter a number", "err"); return; }
+        const res = await rcon(`ap.setattrn ${name} ${attr} ${parseFloat(val)}`);
+        const ok = res && res.status === "ok" && !/FAIL|unavailable/i.test(res.message || "");
+        toast((res && res.message) || "no response", ok ? "ok" : "err");
+        if (ok) readout.textContent = res.message;
+    });
+
+    // Quick-preset buttons
+    for (const btn of document.querySelectorAll("button[data-quick]")) {
+        btn.addEventListener("click", async () => {
+            const name = playerSelect.value;
+            if (!name) { toast("Pick a player first", "err"); return; }
+            const [attr, valStr] = btn.dataset.quick.split("=");
+            if (!attr || !valStr) return;
+            const res = await rcon(`ap.setattrn ${name} ${attr} ${valStr}`);
+            const ok = res && res.status === "ok" && !/FAIL|unavailable/i.test(res.message || "");
+            toast(`${attr}=${valStr}: ${res && res.message || "?"}`, ok ? "ok" : "err");
+            if (ok) readout.textContent = res.message;
+        });
+    }
+
+    attrsBuilt = true;
 }
 
 // ---------------------------------------------------------------------------

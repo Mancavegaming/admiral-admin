@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file. Format is l
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-04-23
+
+### Added
+
+- **Attributes tab** in the web UI — dropdown of ~150 `R5AttributeSet` fields grouped into Survival / Combat / Stamina / Damage Done / Damage Taken / Corruption. Read any current attribute or write any new value. Eight quick-preset buttons for common cheats (MaxHealth 9999, 100% crit, 5× damage out, 99% damage resist, MaxComfort 9999, etc.).
+- **Per-player row actions**: Heal / Feed / Revive / Kill buttons + Teleport-to-other-player dropdown on the Players tab.
+- `ap.feedn` now walks all spawned attribute sets via ASC.SpawnedAttributes and refills Health / Stamina / Comfort / Posture (Windrose uses `R5ComfortAttributeSet` for its "hunger" analogue). Also zeros CorruptionStatus as a bonus cleanse.
+- Inspector (`ap.inspectn`) enhancements: enumerates `ASC.SpawnedAttributes` and scans all UObjects for inventory-related class names. Used during reverse engineering.
+
+### Fixed
+
+- `ap.setattrn` / `ap.healn` / `ap.damagen` / `ap.kill` now use the correct `FGameplayAttributeData` layout (vtable ptr + BaseValue + CurrentValue). Previously read the vtable as a float and got 0.
+- `install.ps1` handles the case where the server is running and holds `main.dll`: compares hashes and silently skips if unchanged instead of erroring.
+
+### Known limits
+
+- Give-item is **deferred**. Windrose's inventory is rule-based (`R5BLInventory_AddItemsRule` and ~30 other R5BusinessRules rule classes) — items aren't added by a direct call; you construct a rule + params + apply. Multi-session reverse engineering job. Tracked in #16.
+- Chat broadcast still requires a non-RPC path (`ClientMessage` crashes UE4SS marshalling). Tracked in #20.
+- Windrose's hunger UI icon persists even after `ap.feedn` fills Comfort — the icon is tied to a separate GameplayEffect cleared only by eating a food item (which give-item would unlock).
+
 ## [0.2.0] — 2026-04-22
 
 The C++ unlock.

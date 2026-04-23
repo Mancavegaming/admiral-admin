@@ -39,6 +39,7 @@
         <button data-tab="players" class="tab-btn tab-active">Players</button>
         <button data-tab="world" class="tab-btn">World</button>
         <button data-tab="presets" class="tab-btn">Presets</button>
+        <button data-tab="attrs" class="tab-btn">Attributes</button>
         <button data-tab="announce" class="tab-btn">Announce</button>
         <button data-tab="server" class="tab-btn">Server</button>
         <button data-tab="console" class="tab-btn">Console</button>
@@ -90,6 +91,57 @@
                 Click a card to apply the multiplier bundle. Event presets only change the listed multipliers; others keep their current values.
             </p>
             <div id="presets-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"></div>
+        </section>
+
+        <!-- Attributes -->
+        <section id="tab-attrs" class="tab-panel hidden">
+            <h2 class="tab-heading">Attribute tweaker</h2>
+            <p class="text-sm text-cream/60 mb-4">
+                Read or write any of ~150 GAS attributes on a player's <code>R5AttributeSet</code>.
+                Requires <code>AdmiralsPanelNative.dll</code>. Values write <code>CurrentValue</code>
+                (and <code>BaseValue</code>) — instant, server-authoritative.
+            </p>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                <div class="info-card">
+                    <div class="info-label">Player</div>
+                    <select id="attr-player" class="w-full bg-ink-light border border-gold/30 rounded px-3 py-2 mt-2 focus:outline-none focus:border-gold">
+                        <option value="">(no player online)</option>
+                    </select>
+                </div>
+                <div class="info-card">
+                    <div class="info-label">Attribute</div>
+                    <select id="attr-name" class="w-full bg-ink-light border border-gold/30 rounded px-3 py-2 mt-2 focus:outline-none focus:border-gold">
+                        <option value="">pick an attribute…</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="flex items-center gap-3 mb-4">
+                <button id="attr-read" class="btn-primary">Read current</button>
+                <span id="attr-readout" class="text-sm text-cream/70 font-mono"></span>
+            </div>
+
+            <div class="flex items-end gap-3 mb-6">
+                <div class="flex-1">
+                    <label class="info-label block mb-1">New value</label>
+                    <input type="number" id="attr-value" step="any" placeholder="e.g. 9999"
+                           class="w-full bg-ink-light border border-gold/30 rounded px-3 py-2 focus:outline-none focus:border-gold font-mono">
+                </div>
+                <button id="attr-set" class="btn-primary">Set</button>
+            </div>
+
+            <h3 class="text-cream/70 text-sm uppercase tracking-wider mb-2">Quick presets</h3>
+            <div class="flex flex-wrap gap-2 mb-4">
+                <button class="row-btn" data-quick="MaxHealth=9999">MaxHealth 9999</button>
+                <button class="row-btn" data-quick="Damage=500">Damage 500</button>
+                <button class="row-btn" data-quick="Armor=9999">Armor 9999</button>
+                <button class="row-btn" data-quick="MaxStamina=9999">MaxStamina 9999</button>
+                <button class="row-btn" data-quick="MaxComfort=9999">MaxComfort 9999</button>
+                <button class="row-btn" data-quick="CriticalChanceBase=1">100% Crit</button>
+                <button class="row-btn" data-quick="GlobalDamageDoneModifier=5">5x Damage Out</button>
+                <button class="row-btn" data-quick="GlobalDamageTakenResist=0.99">99% Damage Resist</button>
+            </div>
         </section>
 
         <!-- Announce -->
