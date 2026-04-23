@@ -20,6 +20,7 @@
 #include <Unreal/AActor.hpp>
 #include <Unreal/FProperty.hpp>
 #include <Unreal/FString.hpp>
+#include <Unreal/Core/Containers/Array.hpp>
 
 using namespace RC;
 using namespace RC::Unreal;
@@ -291,37 +292,79 @@ static int lua_heal(const LuaMadeSimple::Lua& lua)
     return 1;
 }
 
-// ap_native_feed(name) -> string. Refills stamina + health.
+// ap_native_feed(name) -> string. Refills survival-style attributes across
+// all spawned attribute sets: Health, Stamina, Comfort (Windrose's "hunger"),
+// Posture. Also zeroes Corruption if present. Uses an explicit allowlist so
+// we don't accidentally max out debuff meters.
 static int lua_feed(const LuaMadeSimple::Lua& lua)
 {
     if (!lua.is_string()) { lua.set_string("usage: ap_native_feed(name)"); return 1; }
     auto target = to_wlower(lua.get_string());
     auto found = find_player_by_name(target);
     if (!found.pawn) { lua.set_string("player not found"); return 1; }
-    auto* attrset = get_attribute_set(found);
-    if (!attrset) { lua.set_string("AttributeSet not found"); return 1; }
+    if (!found.state) { lua.set_string("PlayerState not found"); return 1; }
+
+    // Walk ASC.SpawnedAttributes
+    auto* asc_prop = found.state->GetPropertyByNameInChain(STR("R5AbilitySystemComponent"));
+    if (!asc_prop) { lua.set_string("ASC prop missing"); return 1; }
+    auto** asc_ptr = asc_prop->ContainerPtrToValuePtr<UObject*>(found.state);
+    if (!asc_ptr || !*asc_ptr) { lua.set_string("ASC null"); return 1; }
+    UObject* asc = *asc_ptr;
+
+    auto* sa_prop = asc->GetPropertyByNameInChain(STR("SpawnedAttributes"));
+    if (!sa_prop) { lua.set_string("SpawnedAttributes missing"); return 1; }
+    auto* arr = sa_prop->ContainerPtrToValuePtr<TArray<UObject*>>(asc);
+    if (!arr) { lua.set_string("SpawnedAttributes null"); return 1; }
+
+    // Attributes we want at MAX after feed (each has a matching "Max" + non-Max
+    // pair in Windrose; the non-Max is what we write).
+    struct Refill { const TCHAR* cur; const TCHAR* max_name; };
+    static const Refill refills[] = {
+        { STR("Health"),  STR("MaxHealth")  },
+        { STR("Stamina"), STR("MaxStamina") },
+        { STR("Comfort"), STR("MaxComfort") },  // Windrose's "hunger" proxy
+        { STR("Posture"), STR("MaxPosture") },
+    };
+    // Debuff meters we want at ZERO after feed.
+    static const TCHAR* zeroOut[] = {
+        STR("CorruptionStatus"),
+    };
 
     std::string out;
-    // Iterate known attribute pairs: fill current to max
-    const TCHAR* pairs[][2] = {
-        {STR("Health"),   STR("MaxHealth")},
-        {STR("Stamina"),  STR("MaxStamina")},
-    };
-    for (auto& pr : pairs)
-    {
-        float cur = 0, mx = 0;
-        if (read_attribute(attrset, pr[0], &cur) &&
-            read_attribute(attrset, pr[1], &mx))
-        {
-            write_attribute(attrset, pr[0], mx);
-            char buf[128];
-            std::snprintf(buf, sizeof(buf), "%s %.1f -> %.1f; ",
-                          w_to_narrow(pr[0]).c_str(),
-                          static_cast<double>(cur), static_cast<double>(mx));
-            out += buf;
+
+    for (int32 i = 0; i < arr->Num(); ++i) {
+        UObject* attrset = (*arr)[i];
+        if (!attrset) continue;
+
+        // Refill pairs
+        for (const auto& r : refills) {
+            float cur = 0, mx = 0;
+            if (read_attribute(attrset, r.cur, &cur) &&
+                read_attribute(attrset, r.max_name, &mx) && mx > 0.0f)
+            {
+                write_attribute(attrset, r.cur, mx);
+                char buf[96];
+                std::snprintf(buf, sizeof(buf), "%s %.1f->%.1f ",
+                              w_to_narrow(r.cur).c_str(),
+                              static_cast<double>(cur), static_cast<double>(mx));
+                out += buf;
+            }
+        }
+
+        // Zero-out debuffs
+        for (const TCHAR* name : zeroOut) {
+            float cur = 0;
+            if (read_attribute(attrset, name, &cur) && cur > 0.0f) {
+                write_attribute(attrset, name, 0.0f);
+                char buf[96];
+                std::snprintf(buf, sizeof(buf), "%s %.1f->0 ",
+                              w_to_narrow(name).c_str(),
+                              static_cast<double>(cur));
+                out += buf;
+            }
         }
     }
-    if (out.empty()) out = "no attributes refilled";
+    if (out.empty()) out = "no refillable attributes found";
     lua.set_string(out);
     return 1;
 }
@@ -496,6 +539,32 @@ static int lua_inspect(const LuaMadeSimple::Lua& lua)
     dump_child(found.state, STR("R5AbilitySystemComponent"),  "R5AbilitySystemComponent");
     dump_child(found.state, STR("PostureAttributeSet"),       "PostureAttributeSet");
     dump_child(found.state, STR("RangeWeaponAttributeSet"),   "RangeWeaponAttributeSet");
+
+    // Walk ASC.SpawnedAttributes — every attribute set GAS knows about.
+    do {
+        if (!found.state) break;
+        auto* asc_prop = found.state->GetPropertyByNameInChain(STR("R5AbilitySystemComponent"));
+        if (!asc_prop) break;
+        auto** asc_ptr = asc_prop->ContainerPtrToValuePtr<UObject*>(found.state);
+        if (!asc_ptr || !*asc_ptr) break;
+        UObject* asc = *asc_ptr;
+
+        auto* sa_prop = asc->GetPropertyByNameInChain(STR("SpawnedAttributes"));
+        if (!sa_prop) { out += "SpawnedAttributes: <no prop>\n"; break; }
+        auto* arr = sa_prop->ContainerPtrToValuePtr<TArray<UObject*>>(asc);
+        if (!arr) { out += "SpawnedAttributes: <null>\n"; break; }
+
+        out += "\nASC.SpawnedAttributes (";
+        out += std::to_string(arr->Num());
+        out += " set(s)):\n";
+        for (int32 i = 0; i < arr->Num(); ++i) {
+            UObject* attrset = (*arr)[i];
+            if (!attrset) { out += "  [" + std::to_string(i) + "] <null>\n"; continue; }
+            char label[64];
+            std::snprintf(label, sizeof(label), "SpawnedAttributes[%d]", i);
+            dump_class_props(attrset, label);
+        }
+    } while (false);
 
     lua.set_string(out);
     return 1;
