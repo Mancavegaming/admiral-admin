@@ -9,6 +9,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <Mod/CppUserModBase.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
@@ -20,6 +21,10 @@
 #include <Unreal/AActor.hpp>
 #include <Unreal/FProperty.hpp>
 #include <Unreal/FString.hpp>
+#include <Unreal/GameplayStatics.hpp>
+#include <Unreal/Transform.hpp>
+#include <Unreal/UnrealCoreStructs.hpp>
+#include <Unreal/Quat.hpp>
 #include <Unreal/Core/Containers/Array.hpp>
 
 using namespace RC;
@@ -740,6 +745,10 @@ static int lua_classprobe(const LuaMadeSimple::Lua& lua)
     static const TCHAR* prefixes[] = {
         STR("/Script/R5BusinessRules."),
         STR("/Script/R5."),
+        STR("/Script/R5ActionManager."),
+        STR("/Script/R5Core."),
+        STR("/Script/R5Gameplay."),
+        STR("/Script/GameplayAbilities."),
         STR("/Script/Engine."),
         STR("/Script/CoreUObject."),
     };
@@ -749,12 +758,35 @@ static int lua_classprobe(const LuaMadeSimple::Lua& lua)
         classObj = UObjectGlobals::FindObject(nullptr, nullptr, path.c_str());
         if (classObj) break;
     }
+
+    // Fallback: scan all loaded UObjects for any struct-like object with this
+    // exact name. Handles classes in packages we didn't guess + BP classes.
+    std::string found_via;
     if (!classObj) {
-        lua.set_string("Class not found: " + name_narrow + " (tried R5BusinessRules, R5, Engine, CoreUObject)");
+        UObjectGlobals::ForEachUObject([&](UObject* obj, int32, int32) {
+            if (!obj) return LoopAction::Continue;
+            auto own_name = obj->GetName();
+            if (std::wstring_view(own_name) != name_wide) return LoopAction::Continue;
+            auto* meta = obj->GetClassPrivate();
+            if (!meta) return LoopAction::Continue;
+            auto meta_name = meta->GetName();
+            // Only struct-like (Class / ScriptStruct / BlueprintGeneratedClass)
+            if (std::wstring_view(meta_name).find(STR("Class")) == std::wstring_view::npos &&
+                std::wstring_view(meta_name).find(STR("Struct")) == std::wstring_view::npos) {
+                return LoopAction::Continue;
+            }
+            classObj = obj;
+            found_via = " (found via UObject scan)";
+            return LoopAction::Break;
+        });
+    }
+
+    if (!classObj) {
+        lua.set_string("Class not found: " + name_narrow + " (tried prefixes + UObject scan)");
         return 1;
     }
 
-    std::string out = "Class '" + name_narrow + "' = " + w_to_narrow(classObj->GetFullName()) + "\n";
+    std::string out = "Class '" + name_narrow + "'" + found_via + " = " + w_to_narrow(classObj->GetFullName()) + "\n";
     auto* meta = classObj->GetClassPrivate();
     if (meta) out += "meta-class: " + w_to_narrow(meta->GetName()) + "\n";
 
@@ -781,9 +813,10 @@ static int lua_classprobe(const LuaMadeSimple::Lua& lua)
     return 1;
 }
 
-// ap_native_scan(substring) -> string. Scans all UObjects for classes whose
-// name contains the substring. Used for reverse-engineering (find cheat
-// managers, item subsystems, spawn helpers, etc).
+// ap_native_scan(substring) -> string. Scans all UObjects for objects whose
+// own name OR class-name contains the substring. Matches class definitions
+// (UClass objects whose GetName() is the class name) AND instances (whose
+// class's GetName() matches). Used for reverse-engineering.
 static int lua_scan(const LuaMadeSimple::Lua& lua)
 {
     if (!lua.is_string()) { lua.set_string("usage: ap_native_scan(substring)"); return 1; }
@@ -791,21 +824,21 @@ static int lua_scan(const LuaMadeSimple::Lua& lua)
     std::wstring needle;
     for (char c : needle_narrow) needle.push_back(static_cast<wchar_t>(c));
 
-    std::string out = "Classes containing '" + needle_narrow + "' (first 60):\n";
+    std::string out = "UObjects whose own-name or class-name contains '" + needle_narrow + "' (first 80):\n";
     int count = 0;
     UObjectGlobals::ForEachUObject([&](UObject* obj, int32, int32) {
         if (!obj) return LoopAction::Continue;
-        if (count >= 60) return LoopAction::Break;
+        if (count >= 80) return LoopAction::Break;
+        auto own_name = obj->GetName();
         auto* cls = obj->GetClassPrivate();
-        if (!cls) return LoopAction::Continue;
-        auto cname = cls->GetName();
-        if (std::wstring_view(cname).find(needle) == std::wstring_view::npos) {
-            return LoopAction::Continue;
-        }
+        auto cname = cls ? cls->GetName() : std::wstring(STR(""));
+        bool own_match = std::wstring_view(own_name).find(needle) != std::wstring_view::npos;
+        bool cls_match = std::wstring_view(cname).find(needle) != std::wstring_view::npos;
+        if (!own_match && !cls_match) return LoopAction::Continue;
         char buf[256];
         std::snprintf(buf, sizeof(buf), "  [%d] %s  (class: %s)\n",
                       count,
-                      w_to_narrow(obj->GetFullName()).substr(0, 120).c_str(),
+                      w_to_narrow(obj->GetFullName()).substr(0, 140).c_str(),
                       w_to_narrow(cname).c_str());
         out += buf;
         count++;
@@ -813,6 +846,624 @@ static int lua_scan(const LuaMadeSimple::Lua& lua)
     });
     out += "  [total matched: " + std::to_string(count) + "]\n";
     lua.set_string(out);
+    return 1;
+}
+
+// ap_native_scanpath(substring) -> string. Scans all UObjects for those whose
+// FullName (e.g. "BlueprintGeneratedClass /Game/Items/Food/BP_Bread.BP_Bread_C")
+// contains the substring. Use this to hunt for asset paths under /Game/.
+static int lua_scanpath(const LuaMadeSimple::Lua& lua)
+{
+    if (!lua.is_string()) { lua.set_string("usage: ap_native_scanpath(substring)"); return 1; }
+    auto needle_narrow = std::string(lua.get_string());
+    std::wstring needle = to_wlower(needle_narrow);
+
+    std::string out = "UObjects whose full-path contains '" + needle_narrow + "' (first 80):\n";
+    int count = 0;
+    UObjectGlobals::ForEachUObject([&](UObject* obj, int32, int32) {
+        if (!obj) return LoopAction::Continue;
+        if (count >= 80) return LoopAction::Break;
+        auto full = obj->GetFullName();
+        if (wlower(full).find(needle) == std::wstring::npos) {
+            return LoopAction::Continue;
+        }
+        auto* cls = obj->GetClassPrivate();
+        auto cname = cls ? cls->GetName() : std::wstring(STR(""));
+        char buf[320];
+        std::snprintf(buf, sizeof(buf), "  [%d] %s  (class: %s)\n",
+                      count,
+                      w_to_narrow(full).substr(0, 200).c_str(),
+                      w_to_narrow(cname).c_str());
+        out += buf;
+        count++;
+        return LoopAction::Continue;
+    });
+    out += "  [total matched: " + std::to_string(count) + "]\n";
+    lua.set_string(out);
+    return 1;
+}
+
+// ap_native_rawdump(target, [bytes]) -> hex/ascii dump of UObject memory.
+// target is either:
+//   - a class short name (e.g. "R5BLInventorySlotView") — finds first LIVE instance (skips CDO)
+//   - a full path starting with "/" (e.g. "/Engine/Transient.XYZ") — exact FindObject
+// bytes defaults to 256, clamped to [16, 4096].
+//
+// Used to reverse-engineer non-reflected C++ field layouts on classes that
+// have zero UPROPERTY fields (R5BLInventorySlotView, R5BLInventoryView, etc).
+static int lua_rawdump(const LuaMadeSimple::Lua& lua)
+{
+    if (!lua.is_string()) { lua.set_string("usage: ap_native_rawdump(target, [bytes])"); return 1; }
+    auto target_narrow = std::string(lua.get_string());
+    std::wstring target_wide;
+    for (char c : target_narrow) target_wide.push_back(static_cast<wchar_t>(c));
+
+    int bytes = 256;
+    if (lua.is_number()) {
+        bytes = static_cast<int>(lua.get_float());
+        if (bytes < 16)   bytes = 16;
+        if (bytes > 4096) bytes = 4096;
+    }
+
+    UObject* obj = nullptr;
+    std::string how;
+
+    if (!target_narrow.empty() && target_narrow[0] == '/') {
+        obj = UObjectGlobals::FindObject(nullptr, nullptr, target_wide.c_str());
+        how = "FindObject by full path";
+    } else {
+        // Find first live instance (not Default__) of a class with matching name
+        UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+            if (!cur || obj) return obj ? LoopAction::Break : LoopAction::Continue;
+            auto* cls = cur->GetClassPrivate();
+            if (!cls) return LoopAction::Continue;
+            if (std::wstring_view(cls->GetName()) != target_wide) return LoopAction::Continue;
+            auto full = cur->GetFullName();
+            if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+            obj = cur;
+            return LoopAction::Break;
+        });
+        how = "first live instance of class";
+    }
+
+    if (!obj) {
+        lua.set_string("object not found: " + target_narrow + " (" + how + ")");
+        return 1;
+    }
+
+    std::string out;
+    auto fullp = w_to_narrow(obj->GetFullName());
+    out += "obj: " + fullp.substr(0, 200) + "\n";
+    auto* cls = obj->GetClassPrivate();
+    if (cls) {
+        out += "class: " + w_to_narrow(cls->GetName()) + "\n";
+    }
+    out += "addr: ";
+    {
+        char buf[32]; std::snprintf(buf, sizeof(buf), "0x%p", (void*)obj); out += buf;
+    }
+    out += "\ndump: " + std::to_string(bytes) + " bytes\n\n";
+
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(obj);
+    for (int i = 0; i < bytes; i += 16) {
+        char line[256];
+        int pos = std::snprintf(line, sizeof(line), "%04x: ", i);
+        for (int j = 0; j < 16; j++) {
+            if (i + j < bytes)
+                pos += std::snprintf(line + pos, sizeof(line) - pos, "%02x ", ptr[i + j]);
+            else
+                pos += std::snprintf(line + pos, sizeof(line) - pos, "   ");
+        }
+        pos += std::snprintf(line + pos, sizeof(line) - pos, " |");
+        for (int j = 0; j < 16 && (i + j) < bytes; j++) {
+            char c = static_cast<char>(ptr[i + j]);
+            char out_c = (c >= 32 && c < 127) ? c : '.';
+            pos += std::snprintf(line + pos, sizeof(line) - pos, "%c", out_c);
+        }
+        pos += std::snprintf(line + pos, sizeof(line) - pos, "|\n");
+        out += line;
+    }
+
+    lua.set_string(out);
+    return 1;
+}
+
+// ap_native_dumpclass(classname, N) -> list the first N live instances of a class
+// with their full paths, so we can then rawdump a specific one.
+static int lua_dumpclass(const LuaMadeSimple::Lua& lua)
+{
+    if (!lua.is_string()) { lua.set_string("usage: ap_native_dumpclass(classname, [N])"); return 1; }
+    auto cls_narrow = std::string(lua.get_string());
+    std::wstring cls_wide;
+    for (char c : cls_narrow) cls_wide.push_back(static_cast<wchar_t>(c));
+
+    int N = 10;
+    if (lua.is_number()) {
+        N = static_cast<int>(lua.get_float());
+        if (N < 1) N = 1;
+        if (N > 200) N = 200;
+    }
+
+    std::string out = "Live instances of '" + cls_narrow + "' (first " + std::to_string(N) + "):\n";
+    int count = 0;
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur || count >= N) return count >= N ? LoopAction::Break : LoopAction::Continue;
+        auto* cls = cur->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != cls_wide) return LoopAction::Continue;
+        auto full = cur->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+        char buf[320];
+        std::snprintf(buf, sizeof(buf), "  [%d] @0x%p  %s\n",
+                      count, (void*)cur,
+                      w_to_narrow(full).substr(0, 220).c_str());
+        out += buf;
+        count++;
+        return LoopAction::Continue;
+    });
+    out += "  [total: " + std::to_string(count) + "]\n";
+    lua.set_string(out);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Actor spawning via UGameplayStatics (give-item path B: spawn a pickup
+// actor at the player's feet; the player's R5Ability_Loot_AutoPickup magnets
+// it into their inventory on proximity).
+// ---------------------------------------------------------------------------
+
+// Read actor location via K2_GetActorLocation UFunction.
+static FVector get_actor_location(AActor* actor)
+{
+    FVector loc{};
+    if (!actor) return loc;
+    UFunction* fn = actor->GetFunctionByNameInChain(STR("K2_GetActorLocation"));
+    if (!fn) return loc;
+    struct { FVector ReturnValue; } params{};
+    actor->ProcessEvent(fn, &params);
+    return params.ReturnValue;
+}
+
+// ap_native_loc(player) -> string. Returns player's K2_GetActorLocation. Use
+// this to verify the location primitive works on its own before spawning.
+static int lua_loc(const LuaMadeSimple::Lua& lua)
+{
+    if (!lua.is_string()) { lua.set_string("usage: ap_native_loc(player)"); return 1; }
+    auto target = to_wlower(lua.get_string());
+    auto p = find_player_by_name(target);
+    if (!p.pawn) { lua.set_string("player not found"); return 1; }
+    UFunction* fn = p.pawn->GetFunctionByNameInChain(STR("K2_GetActorLocation"));
+    if (!fn) { lua.set_string("K2_GetActorLocation not found on pawn"); return 1; }
+    FVector v{};
+    struct { FVector ReturnValue; } params{};
+    p.pawn->ProcessEvent(fn, &params);
+    v = params.ReturnValue;
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "(%.1f, %.1f, %.1f)",
+                  static_cast<double>(v.X()),
+                  static_cast<double>(v.Y()),
+                  static_cast<double>(v.Z()));
+    lua.set_string(std::string(buf));
+    return 1;
+}
+
+// ap_native_funcparams(funcpath) -> dump a UFunction's parameter layout
+// (property name, offset, size, type). Works for any reflected UFunction.
+static int lua_funcparams(const LuaMadeSimple::Lua& lua)
+{
+    if (!lua.is_string()) { lua.set_string("usage: ap_native_funcparams(path)"); return 1; }
+    auto p_narrow = std::string(lua.get_string());
+    std::wstring p_wide;
+    for (char c : p_narrow) p_wide.push_back(static_cast<wchar_t>(c));
+    UObject* obj = UObjectGlobals::FindObject(nullptr, nullptr, p_wide.c_str());
+    if (!obj) { lua.set_string("function not found: " + p_narrow); return 1; }
+    auto* meta = obj->GetClassPrivate();
+    if (!meta || std::wstring_view(meta->GetName()) != STR("Function")) {
+        lua.set_string("not a UFunction (meta-class: " + (meta ? w_to_narrow(meta->GetName()) : std::string("null")) + ")");
+        return 1;
+    }
+    auto* fn = reinterpret_cast<UFunction*>(obj);
+    std::string out = "function: " + w_to_narrow(fn->GetName()) + "\n";
+    out += "PropertiesSize: " + std::to_string(fn->GetPropertiesSize()) + " bytes\n";
+    auto* asStruct = reinterpret_cast<RC::Unreal::UStruct*>(fn);
+    out += "\nProperties:\n";
+    int i = 0;
+    for (auto* prop : asStruct->ForEachPropertyInChain()) {
+        if (!prop) continue;
+        if (i++ >= 30) { out += "  ...(truncated)\n"; break; }
+        auto name = w_to_narrow(prop->GetName());
+        auto cpp = w_to_narrow(std::wstring_view(*prop->GetCPPType()));
+        auto offset = prop->GetOffset_Internal();
+        auto size = prop->GetSize();
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "  +0x%04X  size=0x%04X  %-28s  %s\n",
+                      offset, size, name.c_str(), cpp.c_str());
+        out += buf;
+    }
+    lua.set_string(out);
+    return 1;
+}
+
+// ap_native_yankactor(player, path) -> teleport any actor (by full path) to player.
+// Use to test game mechanics (e.g. yank a populated R5LootActor to the player and
+// see if auto-pickup triggers).
+static int lua_yankactor(const LuaMadeSimple::Lua& lua)
+{
+    if (!lua.is_string()) { lua.set_string("usage: ap_native_yankactor(player, path)"); return 1; }
+    auto target = to_wlower(lua.get_string());
+    if (!lua.is_string()) { lua.set_string("path required"); return 1; }
+    auto path_narrow = std::string(lua.get_string());
+    std::wstring path_wide;
+    for (char c : path_narrow) path_wide.push_back(static_cast<wchar_t>(c));
+
+    auto player = find_player_by_name(target);
+    if (!player.pawn) { lua.set_string("player not found"); return 1; }
+
+    UObject* found = UObjectGlobals::FindObject(nullptr, nullptr, path_wide.c_str());
+    if (!found) { lua.set_string("actor not found at path"); return 1; }
+    AActor* target_actor = reinterpret_cast<AActor*>(found);
+
+    // Read player location
+    FVector loc{};
+    {
+        UFunction* fn = player.pawn->GetFunctionByNameInChain(STR("K2_GetActorLocation"));
+        if (!fn) { lua.set_string("K2_GetActorLocation missing"); return 1; }
+        struct { FVector ReturnValue; } p{};
+        player.pawn->ProcessEvent(fn, &p);
+        loc = p.ReturnValue;
+    }
+
+    // Teleport via K2_TeleportTo(FVector, FRotator) — signature: bool Teleport(FVector dest, FRotator rot)
+    UFunction* tp_fn = target_actor->GetFunctionByNameInChain(STR("K2_TeleportTo"));
+    if (!tp_fn) {
+        // Fall back to K2_SetActorLocation
+        tp_fn = target_actor->GetFunctionByNameInChain(STR("K2_SetActorLocation"));
+        if (!tp_fn) { lua.set_string("neither K2_TeleportTo nor K2_SetActorLocation on target"); return 1; }
+    }
+
+    // Build params: FVector DestLocation at +0x00 (24 bytes), FRotator at +0x18,
+    // then bools for sweep/teleport, then ReturnValue. Use oversized buffer.
+    std::vector<uint8_t> params(0x80, 0);
+    std::memcpy(params.data() + 0x00, &loc, sizeof(FVector));
+    // K2_TeleportTo bool flags — 0 default is fine
+    target_actor->ProcessEvent(tp_fn, params.data());
+
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "yanked %s to (%.1f, %.1f, %.1f) via %s",
+                  path_narrow.substr(0, 120).c_str(),
+                  static_cast<double>(loc.X()),
+                  static_cast<double>(loc.Y()),
+                  static_cast<double>(loc.Z()),
+                  w_to_narrow(tp_fn->GetName()).c_str());
+    lua.set_string(std::string(buf));
+    return 1;
+}
+
+// ap_native_giveloot(player, [count]) -> teleport N random R5LootActors to player.
+// Each actor auto-picks-up on proximity via the player's R5Ability_Loot_AutoPickup.
+// Delivers whatever items are already populated on those loot actors.
+static int lua_giveloot(const LuaMadeSimple::Lua& lua)
+{
+    if (!lua.is_string()) { lua.set_string("usage: ap_native_giveloot(player, [count])"); return 1; }
+    auto target = to_wlower(lua.get_string());
+    int count = 1;
+    if (lua.is_number()) {
+        count = static_cast<int>(lua.get_float());
+        if (count < 1) count = 1;
+        if (count > 20) count = 20;
+    }
+    auto player = find_player_by_name(target);
+    if (!player.pawn) { lua.set_string("player not found"); return 1; }
+
+    FVector loc{};
+    {
+        UFunction* fn = player.pawn->GetFunctionByNameInChain(STR("K2_GetActorLocation"));
+        if (!fn) { lua.set_string("K2_GetActorLocation missing"); return 1; }
+        struct { FVector ReturnValue; } p{};
+        player.pawn->ProcessEvent(fn, &p);
+        loc = p.ReturnValue;
+    }
+
+    // Collect all R5LootActor instances that have a non-null LootView (populated),
+    // skipping the CDO. Empty loot actors (LootView=null) won't deliver anything.
+    std::vector<AActor*> populated;
+    int total_seen = 0, empty_count = 0;
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur) return LoopAction::Continue;
+        auto* cls = cur->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5LootActor")) return LoopAction::Continue;
+        auto full = cur->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+        total_seen++;
+        // Check LootView at +0x310 (verified via rawdump on an existing populated actor)
+        UObject* loot_view = *reinterpret_cast<UObject**>(
+            reinterpret_cast<uint8_t*>(cur) + 0x310);
+        if (!loot_view) { empty_count++; return LoopAction::Continue; }
+        populated.push_back(reinterpret_cast<AActor*>(cur));
+        return LoopAction::Continue;
+    });
+
+    if (populated.empty()) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "found %d R5LootActor(s) but all are empty (LootView=null). "
+                      "Kill mobs or break resource nodes to populate world loot first.",
+                      total_seen);
+        lua.set_string(std::string(buf));
+        return 1;
+    }
+
+    // Teleport up to `count` populated ones
+    int to_take = static_cast<int>(populated.size());
+    if (to_take > count) to_take = count;
+
+    int teleported = 0;
+    for (int i = 0; i < to_take; ++i) {
+        AActor* a = populated[i];
+        UFunction* tp_fn = a->GetFunctionByNameInChain(STR("K2_TeleportTo"));
+        if (!tp_fn) tp_fn = a->GetFunctionByNameInChain(STR("K2_SetActorLocation"));
+        if (!tp_fn) continue;
+        std::vector<uint8_t> params(0x80, 0);
+        std::memcpy(params.data() + 0x00, &loc, sizeof(FVector));
+        a->ProcessEvent(tp_fn, params.data());
+        teleported++;
+    }
+
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "world has %d loot actor(s): %d populated, %d empty. "
+                  "Teleported %d to you. Auto-pickup should deliver items shortly.",
+                  total_seen, (int)populated.size(), empty_count, teleported);
+    lua.set_string(std::string(buf));
+    return 1;
+}
+
+// ap_native_lootinspect([bytes]) -> find first populated R5LootActor and dump its
+// LootView raw memory. Used for reverse-engineering the DropView's non-reflected
+// inventory structure (where item stacks actually live in memory).
+static int lua_lootinspect(const LuaMadeSimple::Lua& lua)
+{
+    int bytes = 512;
+    if (lua.is_number()) {
+        bytes = static_cast<int>(lua.get_float());
+        if (bytes < 64) bytes = 64;
+        if (bytes > 4096) bytes = 4096;
+    }
+
+    AActor* found_actor = nullptr;
+    UObject* loot_view = nullptr;
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur || found_actor) return found_actor ? LoopAction::Break : LoopAction::Continue;
+        auto* cls = cur->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5LootActor")) return LoopAction::Continue;
+        auto full = cur->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+        UObject* lv = *reinterpret_cast<UObject**>(
+            reinterpret_cast<uint8_t*>(cur) + 0x310);
+        if (!lv) return LoopAction::Continue;
+        found_actor = reinterpret_cast<AActor*>(cur);
+        loot_view = lv;
+        return LoopAction::Break;
+    });
+
+    if (!found_actor) {
+        lua.set_string("no populated R5LootActor found in world");
+        return 1;
+    }
+
+    std::string out;
+    {
+        char b[160];
+        std::snprintf(b, sizeof(b), "actor: %s\n",
+                      w_to_narrow(found_actor->GetFullName()).substr(0, 140).c_str());
+        out += b;
+        std::snprintf(b, sizeof(b), "loot_view addr: 0x%p\n", (void*)loot_view);
+        out += b;
+        auto* lv_cls = loot_view->GetClassPrivate();
+        if (lv_cls) {
+            std::snprintf(b, sizeof(b), "loot_view class: %s\n",
+                          w_to_narrow(lv_cls->GetName()).c_str());
+            out += b;
+        }
+    }
+    out += "\nLootView memory dump:\n";
+
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(loot_view);
+    for (int i = 0; i < bytes; i += 16) {
+        char line[256];
+        int pos = std::snprintf(line, sizeof(line), "%04x: ", i);
+        for (int j = 0; j < 16; j++) {
+            if (i + j < bytes)
+                pos += std::snprintf(line + pos, sizeof(line) - pos, "%02x ", ptr[i + j]);
+            else
+                pos += std::snprintf(line + pos, sizeof(line) - pos, "   ");
+        }
+        pos += std::snprintf(line + pos, sizeof(line) - pos, " |");
+        for (int j = 0; j < 16 && (i + j) < bytes; j++) {
+            char c = static_cast<char>(ptr[i + j]);
+            char out_c = (c >= 32 && c < 127) ? c : '.';
+            pos += std::snprintf(line + pos, sizeof(line) - pos, "%c", out_c);
+        }
+        pos += std::snprintf(line + pos, sizeof(line) - pos, "|\n");
+        out += line;
+    }
+
+    lua.set_string(out);
+    return 1;
+}
+
+// ap_native_lootlist() -> list populated R5LootActors with their paths + LootView addr.
+// Helps the specific-item-give workflow: first list what's available, then yank a specific one.
+static int lua_lootlist(const LuaMadeSimple::Lua& lua)
+{
+    int N = 20;
+    if (lua.is_number()) {
+        N = static_cast<int>(lua.get_float());
+        if (N < 1) N = 1;
+        if (N > 100) N = 100;
+    }
+    std::string out = "Populated R5LootActors (LootView != null):\n";
+    int shown = 0, empty = 0;
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur || shown >= N) return shown >= N ? LoopAction::Break : LoopAction::Continue;
+        auto* cls = cur->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5LootActor")) return LoopAction::Continue;
+        auto full = cur->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+        UObject* lv = *reinterpret_cast<UObject**>(
+            reinterpret_cast<uint8_t*>(cur) + 0x310);
+        if (!lv) { empty++; return LoopAction::Continue; }
+        char buf[320];
+        std::snprintf(buf, sizeof(buf), "  [%d] actor=0x%p  lv=0x%p  %s\n",
+                      shown, (void*)cur, (void*)lv,
+                      w_to_narrow(full).substr(0, 180).c_str());
+        out += buf;
+        shown++;
+        return LoopAction::Continue;
+    });
+    out += "  [populated shown: " + std::to_string(shown) +
+           ", empty skipped: " + std::to_string(empty) + "]\n";
+    lua.set_string(out);
+    return 1;
+}
+
+// ap_native_findclass(path) -> string. Resolves a full object path and reports
+// what we got back (class-of, name, full name). Use to verify class paths.
+static int lua_findclass(const LuaMadeSimple::Lua& lua)
+{
+    if (!lua.is_string()) { lua.set_string("usage: ap_native_findclass(path)"); return 1; }
+    auto p_narrow = std::string(lua.get_string());
+    std::wstring p_wide;
+    for (char c : p_narrow) p_wide.push_back(static_cast<wchar_t>(c));
+    UObject* obj = UObjectGlobals::FindObject(nullptr, nullptr, p_wide.c_str());
+    if (!obj) { lua.set_string("not found: " + p_narrow); return 1; }
+    std::string out = "full: " + w_to_narrow(obj->GetFullName()) + "\n";
+    auto* cls = obj->GetClassPrivate();
+    if (cls) out += "class: " + w_to_narrow(cls->GetName()) + "\n";
+    // Addr for debugging
+    char b[64]; std::snprintf(b, sizeof(b), "addr: 0x%p", (void*)obj);
+    out += b;
+    lua.set_string(out);
+    return 1;
+}
+
+// ap_native_spawn(player_name, class_path, [dx, dy, dz])
+// Spawns the given actor class at player's location + offset.
+// Heavily instrumented — logs to UE4SS.log at every step so we can diagnose crashes.
+static int lua_spawn(const LuaMadeSimple::Lua& lua)
+{
+    using namespace RC;
+    Output::send<LogLevel::Verbose>(STR("[spawn] ENTER\n"));
+
+    if (!lua.is_string()) { lua.set_string("usage: ap_native_spawn(player, class_path, [dx, dy, dz])"); return 1; }
+    auto target_name = to_wlower(lua.get_string());
+    if (!lua.is_string()) { lua.set_string("class_path required"); return 1; }
+    auto class_path_narrow = std::string(lua.get_string());
+    std::wstring class_path_wide;
+    for (char c : class_path_narrow) class_path_wide.push_back(static_cast<wchar_t>(c));
+
+    double dx = 0, dy = 0, dz = 200;  // default: 200 units up (well above feet)
+    if (lua.is_number()) { dx = lua.get_float(); }
+    if (lua.is_number()) { dy = lua.get_float(); }
+    if (lua.is_number()) { dz = lua.get_float(); }
+
+    Output::send<LogLevel::Verbose>(STR("[spawn] finding player\n"));
+    auto player = find_player_by_name(target_name);
+    if (!player.pawn) { lua.set_string("player not found"); return 1; }
+
+    Output::send<LogLevel::Verbose>(STR("[spawn] finding class\n"));
+    UObject* class_obj = UObjectGlobals::FindObject(nullptr, nullptr, class_path_wide.c_str());
+    if (!class_obj) {
+        lua.set_string("class not found at path: " + class_path_narrow);
+        return 1;
+    }
+
+    // Verify it's a UClass-like object before reinterpret_cast
+    auto* meta = class_obj->GetClassPrivate();
+    if (!meta) { lua.set_string("class_obj has no class"); return 1; }
+    auto meta_name = w_to_narrow(meta->GetName());
+    if (meta_name != "Class" && meta_name != "BlueprintGeneratedClass") {
+        lua.set_string("not a UClass: meta-class is " + meta_name);
+        return 1;
+    }
+    auto* pickup_class = reinterpret_cast<UClass*>(class_obj);
+
+    Output::send<LogLevel::Verbose>(STR("[spawn] getting actor location\n"));
+    UFunction* loc_fn = player.pawn->GetFunctionByNameInChain(STR("K2_GetActorLocation"));
+    if (!loc_fn) { lua.set_string("K2_GetActorLocation not on pawn"); return 1; }
+    struct { FVector ReturnValue; } loc_params{};
+    player.pawn->ProcessEvent(loc_fn, &loc_params);
+    FVector loc = loc_params.ReturnValue;
+    double px = loc.X(), py = loc.Y(), pz = loc.Z();
+
+    Output::send<LogLevel::Verbose>(STR("[spawn] building transform\n"));
+    FVector spawn_loc(px + dx, py + dy, pz + dz);
+    FQuat rot(0, 0, 0, 1);
+    FVector scale(1, 1, 1);
+    FTransform xform(rot, spawn_loc, scale);
+
+    // Locate UGameplayStatics CDO + both UFunctions. We call ProcessEvent manually
+    // with buffers sized by the function's reflected GetPropertiesSize(), bypassing
+    // UE4SS's wrappers (which omit the UE5.2+ TransformScaleMethod field in their
+    // FinishSpawningActor_Params struct and corrupt adjacent memory on ProcessEvent).
+    UObject* gs_cdo = UObjectGlobals::FindObject(nullptr, nullptr,
+        STR("/Script/Engine.Default__GameplayStatics"));
+    if (!gs_cdo) { lua.set_string("GameplayStatics CDO missing"); return 1; }
+
+    UFunction* begin_fn  = gs_cdo->GetFunctionByNameInChain(STR("BeginDeferredActorSpawnFromClass"));
+    UFunction* finish_fn = gs_cdo->GetFunctionByNameInChain(STR("FinishSpawningActor"));
+    if (!begin_fn || !finish_fn) { lua.set_string("Begin/Finish UFunctions not found"); return 1; }
+
+    // UE5.2+ reflected layouts we verified via ap.funcparamsn:
+    //
+    // BeginDeferredActorSpawnFromClass (0x90 = 144 bytes):
+    //   +0x00 WorldContextObject*   +0x08 ActorClass*   +0x10 FTransform (96B)
+    //   +0x70 CollisionHandling(u8) +0x78 Owner*        +0x80 ScaleMethod(u8)
+    //   +0x88 ReturnValue*
+    //
+    // FinishSpawningActor (0x80 = 128 bytes):
+    //   +0x00 Actor* +0x10 FTransform (96B) +0x70 ScaleMethod(u8) +0x78 ReturnValue*
+
+    Output::send<LogLevel::Verbose>(STR("[spawn] calling BeginDeferredActorSpawnFromClass (manual)\n"));
+    uint32_t begin_size = begin_fn->GetPropertiesSize();
+    if (begin_size < 0x90 || begin_size > 0x200) begin_size = 0x100;
+    std::vector<uint8_t> begin_buf(begin_size, 0);
+    *reinterpret_cast<UObject**>(begin_buf.data() + 0x00) = player.pawn;
+    *reinterpret_cast<UClass**>(begin_buf.data() + 0x08)  = pickup_class;
+    std::memcpy(begin_buf.data() + 0x10, &xform, sizeof(FTransform));
+    begin_buf[0x70] = 2;  // AdjustIfPossibleButAlwaysSpawn
+    *reinterpret_cast<AActor**>(begin_buf.data() + 0x78) = nullptr;  // Owner
+    begin_buf[0x80] = 1;  // MultiplyWithRoot
+    gs_cdo->ProcessEvent(begin_fn, begin_buf.data());
+    AActor* actor = *reinterpret_cast<AActor**>(begin_buf.data() + 0x88);
+
+    if (!actor) {
+        lua.set_string("BeginDeferredActorSpawnFromClass returned null");
+        return 1;
+    }
+
+    Output::send<LogLevel::Verbose>(STR("[spawn] calling FinishSpawningActor (manual)\n"));
+    uint32_t finish_size = finish_fn->GetPropertiesSize();
+    if (finish_size < 0x80 || finish_size > 0x200) finish_size = 0x100;
+    std::vector<uint8_t> finish_buf(finish_size, 0);
+    *reinterpret_cast<AActor**>(finish_buf.data() + 0x00) = actor;
+    std::memcpy(finish_buf.data() + 0x10, &xform, sizeof(FTransform));
+    finish_buf[0x70] = 1;  // MultiplyWithRoot
+    gs_cdo->ProcessEvent(finish_fn, finish_buf.data());
+
+    Output::send<LogLevel::Verbose>(STR("[spawn] DONE\n"));
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "spawned %s at (%.1f, %.1f, %.1f) OK",
+                  class_path_narrow.c_str(),
+                  static_cast<double>(spawn_loc.X()),
+                  static_cast<double>(spawn_loc.Y()),
+                  static_cast<double>(spawn_loc.Z()));
+    lua.set_string(std::string(buf));
     return 1;
 }
 
@@ -865,6 +1516,17 @@ public:
         lua.register_function("admiralspanel_native_allstats",lua_allstats);
         lua.register_function("admiralspanel_native_classprobe",lua_classprobe);
         lua.register_function("admiralspanel_native_scan",     lua_scan);
+        lua.register_function("admiralspanel_native_scanpath", lua_scanpath);
+        lua.register_function("admiralspanel_native_rawdump",  lua_rawdump);
+        lua.register_function("admiralspanel_native_dumpclass",lua_dumpclass);
+        lua.register_function("admiralspanel_native_spawn",    lua_spawn);
+        lua.register_function("admiralspanel_native_loc",      lua_loc);
+        lua.register_function("admiralspanel_native_findclass",lua_findclass);
+        lua.register_function("admiralspanel_native_funcparams",lua_funcparams);
+        lua.register_function("admiralspanel_native_yankactor",lua_yankactor);
+        lua.register_function("admiralspanel_native_giveloot", lua_giveloot);
+        lua.register_function("admiralspanel_native_lootlist", lua_lootlist);
+        lua.register_function("admiralspanel_native_lootinspect", lua_lootinspect);
         lua.register_function("admiralspanel_native_inspect", lua_inspect);
         lua.register_function("admiralspanel_native_kill",    lua_kill);
         Output::send<LogLevel::Verbose>(

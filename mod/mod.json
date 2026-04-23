@@ -1,6 +1,6 @@
 {
     "name": "AdmiralsPanel",
-    "version": "0.3.1",
+    "version": "0.4.0",
     "author": "Mancavegaming",
     "description": "Open-source admin panel backend: multiplier tuning, presets, announcements, admin log. Pairs with the web UI at /admiral/.",
     "main": "init.lua"
