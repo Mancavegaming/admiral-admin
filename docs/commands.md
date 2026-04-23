@@ -120,6 +120,62 @@ Recent admin actions:
   [2026-04-22 15:11:42] ap.say Weekend event starts! -> logged
 ```
 
+## ap.tp / ap.tpxyz — teleport
+
+```
+ap.tp <player> <target>
+ap.tpxyz <player> <x> <y> <z>
+```
+
+Server-authoritative teleport via `K2_TeleportTo`. No C++ required. Replicates to clients, no rubber-banding in practice.
+
+## Native commands (require `AdmiralsPanelNative.dll`)
+
+These call into the optional C++ companion mod. See [`native-mod.md`](native-mod.md). If the DLL isn't installed, each returns `"Native feature unavailable (install AdmiralsPanelNative.dll — see cpp/README.md)"`.
+
+### ap.healn / ap.damagen / ap.killn / ap.feedn / ap.reviven
+
+```
+ap.healn <player> <amount>     -- heal, clamped to MaxHealth
+ap.damagen <player> <amount>   -- actual damage (HP drops)
+ap.killn <player>              -- Health = 0
+ap.feedn <player>              -- Health + Stamina -> their max
+ap.reviven <player>            -- Health -> MaxHealth, works on dead players
+```
+
+All write directly to `PlayerState.R5AttributeSet.{Health, Stamina, ...}` — server-authoritative, replicates to clients.
+
+### ap.setattrn / ap.readattrn — generic
+
+```
+ap.setattrn <player> <attr> <value>
+ap.readattrn <player> <attr>
+```
+
+Set or read any attribute on `R5AttributeSet`. Useful attributes:
+
+- Survival: `Health`, `MaxHealth`, `Stamina`, `MaxStamina`, `StaminaRegenRate`
+- Combat: `Damage`, `Armor`, `CriticalChanceBase`, `CriticalDamageDoneModifier`
+- Damage-type multipliers: `FireDamageDoneModifier`, `BluntDamageTakenResist`, etc. (per type: Melee / Range / Cannon / Blunt / Slash / Pierce / Fire / Poison / Cursed / Corrupt / Holy / Crude / Bleed, each with Added/Modifier/Penalty/TakenResist/Weakness/BlockEffectiveness variants)
+
+Full list: run `ap.inspectn <player>` — the "R5AttributeSet" block lists every attribute on your build.
+
+**God-mode example:**
+```
+ap.setattrn Mancave MaxHealth 99999
+ap.setattrn Mancave Armor 99999
+ap.setattrn Mancave Damage 500
+```
+
+### ap.findn / ap.inspectn — debug
+
+```
+ap.findn <player>       -- returns pawn full-name or "not found"
+ap.inspectn <player>    -- full property dump (R5Character + HealthComponent + R5AttributeSet + PlayerState + ASC). Big output.
+```
+
+Useful for discovering new fields after a game patch.
+
 ## Reused WindrosePlus commands (not ours)
 
 These come from stock WindrosePlus and are listed here because the web UI calls them:

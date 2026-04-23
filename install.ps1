@@ -53,7 +53,7 @@ $wpModDir  = Join-Path $GameDir "R5\Binaries\Win64\ue4ss\Mods\WindrosePlus"
 $wpSubMods = Join-Path $wpModDir "Mods"
 $wpWebDir  = Join-Path $GameDir "windrose_plus\server\web"
 
-Write-Step "1/4" "Checking prerequisites..."
+Write-Step "1/5" "Checking prerequisites..."
 if (-not (Test-Path -LiteralPath $wpModDir)) {
     Write-Fail "WindrosePlus is not installed at $wpModDir"
     Write-Host "  Install WindrosePlus first: https://github.com/HumanGenome/WindrosePlus" -ForegroundColor Yellow
@@ -68,7 +68,7 @@ Write-OK "WindrosePlus detected."
 
 # --- Copy mod --------------------------------------------------------------
 
-Write-Step "2/4" "Installing Lua mod..."
+Write-Step "2/5" "Installing Lua mod..."
 
 $repoRoot = $PSScriptRoot
 if ([string]::IsNullOrEmpty($repoRoot)) { $repoRoot = $PWD.Path }
@@ -114,7 +114,7 @@ Write-OK "mods_registry.json updated: $jsonOut"
 
 # --- Copy web panel -------------------------------------------------------
 
-Write-Step "3/4" "Installing web panel..."
+Write-Step "3/5" "Installing web panel..."
 
 $webSrc = Join-Path $repoRoot "web"
 if (-not (Test-Path -LiteralPath $webSrc)) {
@@ -142,9 +142,44 @@ Redirecting to <a href="/admiral/index.html">AdmiralsPanel</a>...
     Write-OK "Redirect helper placed at /admiral.html"
 }
 
+# --- Install native companion DLL if present -------------------------------
+
+Write-Step "4/5" "Installing native companion (optional C++ DLL)..."
+
+$nativeDll = Join-Path $repoRoot "cpp\dist\main.dll"
+if (-not (Test-Path -LiteralPath $nativeDll)) {
+    Write-Info "No cpp\dist\main.dll found - skipping native install."
+    Write-Info "Pure-Lua features (teleport, multipliers, presets) still work."
+    Write-Info "To enable heal/kill/feed/revive: build via cpp\build.ps1 or download the DLL from the release page."
+} else {
+    $ue4ssMods  = Join-Path $GameDir "R5\Binaries\Win64\ue4ss\Mods"
+    $nativeDir  = Join-Path $ue4ssMods "AdmiralsPanelNative"
+    $nativeDlls = Join-Path $nativeDir "dlls"
+    if (-not (Test-Path -LiteralPath $nativeDlls)) {
+        New-Item -ItemType Directory -Path $nativeDlls -Force | Out-Null
+    }
+    Copy-Item $nativeDll (Join-Path $nativeDlls "main.dll") -Force
+    Set-Content -Path (Join-Path $nativeDir "enabled.txt") -Value "1" -Encoding ASCII -NoNewline
+    Write-OK "Deployed main.dll to $nativeDlls"
+
+    # Register in ue4ss\Mods\mods.txt if not already there
+    $modsTxt = Join-Path $ue4ssMods "mods.txt"
+    $alreadyRegistered = $false
+    if (Test-Path -LiteralPath $modsTxt) {
+        $content = Get-Content $modsTxt -Raw
+        if ($content -match "AdmiralsPanelNative") { $alreadyRegistered = $true }
+    }
+    if (-not $alreadyRegistered) {
+        Add-Content -Path $modsTxt -Value "AdmiralsPanelNative : 1"
+        Write-OK "Registered AdmiralsPanelNative in mods.txt"
+    } else {
+        Write-Info "AdmiralsPanelNative already registered in mods.txt"
+    }
+}
+
 # --- Next steps -----------------------------------------------------------
 
-Write-Step "4/4" "Done."
+Write-Step "5/5" "Done."
 Write-Host ""
 Write-Host "  Next steps:" -ForegroundColor Cyan
 Write-Host "    1. If the server is running, wait ~30s for the hot-reload file-watcher"

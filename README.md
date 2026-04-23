@@ -27,9 +27,20 @@ The installer:
 1. Finds your Windrose server directory (or use `-GameDir "C:\path\to\server"`).
 2. Copies the Lua mod into `R5\Binaries\Win64\ue4ss\Mods\WindrosePlus\Mods\admiral-admin\`.
 3. Copies the web panel into `windrose_plus\server\web\admiral\`.
-4. Registers the mod in `mods_registry.json`.
+4. If `cpp\dist\main.dll` exists (either prebuilt from a release or built via `cpp\build.ps1`), deploys it to `R5\Binaries\Win64\ue4ss\Mods\AdmiralsPanelNative\` with `enabled.txt` + `mods.txt` registration. Skips gracefully otherwise.
 
 Re-running is safe — everything is idempotent.
+
+### Getting the native DLL
+
+Two options:
+
+- **Download** — grab `AdmiralsPanelNative-<version>.dll` from the [latest release](https://github.com/Mancavegaming/admiral-admin/releases/latest), drop at `cpp/dist/main.dll`, re-run `install.ps1`.
+- **Build** — requires VS 2022 Build Tools + an Epic Games ↔ GitHub account link (for the UEPseudo submodule). One command:
+  ```powershell
+  cd cpp; powershell -ExecutionPolicy Bypass -File build.ps1
+  ```
+  See [`cpp/README.md`](cpp/README.md) for details.
 
 > **After you update WindrosePlus, re-run `install.ps1`.** WindrosePlus's installer wipes `server/web/` on every update, which removes our panel. Re-running restores it in ~5 seconds.
 
@@ -40,21 +51,27 @@ Re-running is safe — everything is idempotent.
 3. Open your browser to `http://localhost:8780/`, log in with your RCON password.
 4. Navigate to `http://localhost:8780/admiral.html` (or the direct URL `http://localhost:8780/admiral/index.html`).
 
-## What it can (and can't) do in v0.1
+## What it can do (v0.2)
 
-**Can do** (everything below works without a game patch or C++ mod):
+**Pure Lua** (no extra install):
 
-- Per-player speed (the same `wp.speed` WindrosePlus ships — now with a slider UI).
-- Server-wide multipliers: loot, XP, weight, craft cost, stack size, crop speed, cooking speed, inventory size, points per level. Saved to `windrose_plus.json` so they persist across restarts.
+- Per-player speed slider (via WindrosePlus's `wp.speed`).
+- Server-wide multipliers: loot, XP, weight, craft cost, stack size, crop/cooking speed, inventory size, points per level, harvest yield. Persisted to `windrose_plus.json`.
 - Difficulty presets: Vanilla / Easy / Hard / Event: 2× XP / Event: 2× Loot / Event: Chill.
-- Announcement log (broadcasts to server log and `events.log` — see below for why not in-game chat).
-- Live player list with position.
-- Raw RCON console for anything the UI doesn't expose yet.
+- **Teleport** (`ap.tp`, `ap.tpxyz`) — server-authoritative via `K2_TeleportTo`.
+- Announcements, live player list, admin log, raw RCON console.
 
-**Can't do in v0.1** (genuinely blocked by the game's current Lua surface — not a missing feature, a hard limit):
+**With the optional `AdmiralsPanelNative.dll`** (C++ companion, see [`cpp/`](cpp/)):
 
-- Heal, kill, feed (hunger / thirst / stamina), give item, teleport, in-game chat broadcast.
-- These all require calling game UFunctions, which Windrose (in this build) doesn't expose to Lua. A future companion C++ UE4SS mod will unlock them. See [`docs/roadmap.md`](docs/roadmap.md).
+- `ap.healn` / `ap.damagen` / `ap.killn` / `ap.feedn` / `ap.reviven` — real health mods via direct GAS attribute writes (server-authoritative, replicates to clients).
+- `ap.setattrn` / `ap.readattrn` — touch any of the ~100 `R5AttributeSet` fields (MaxHealth, Armor, Damage, all damage-type multipliers, crit stats, etc.). "God mode" and "500 damage/hit" are one command each.
+- See [`docs/native-mod.md`](docs/native-mod.md) for the technical writeup.
+
+**Still not done** (v0.3 roadmap):
+
+- Give-item / drop-item — need another inspector pass on `Equipment` / `InventoryView`.
+- In-game chat broadcast — `ClientMessage` is an RPC and UE4SS struggles with it. Looking for a non-RPC path.
+- UI buttons for the native commands — right now they work via the dashboard console only.
 
 ## How it works
 

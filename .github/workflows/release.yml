@@ -22,7 +22,9 @@ jobs:
       - name: Stage release contents
         run: |
           mkdir -p release/admiral-admin
-          cp -r mod web docs install.ps1 LICENSE README.md CHANGELOG.md release/admiral-admin/
+          cp -r mod web docs cpp install.ps1 LICENSE README.md CHANGELOG.md release/admiral-admin/
+          # Drop any locally-built DLL artefacts — those get attached separately
+          rm -rf release/admiral-admin/cpp/dist
 
       - name: Create zip
         run: |

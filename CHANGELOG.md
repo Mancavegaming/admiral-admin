@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file. Format is l
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-04-22
+
+The C++ unlock.
+
+### Added
+
+- **`AdmiralsPanelNative.dll`** — optional C++ UE4SS companion mod. Exposes gameplay-level admin features that pure Lua can't safely reach, by writing directly to Windrose's GAS (Gameplay Ability System) `R5AttributeSet` struct on `PlayerState`. Source under [`cpp/`](cpp/), one-command build via [`cpp/build.ps1`](cpp/build.ps1), prebuilt DLL attached to each release.
+- **Teleport** (pure Lua, no C++ needed):
+  - `ap.tp <player> <target>` — move player to another player's position.
+  - `ap.tpxyz <player> <x> <y> <z>` — move to coords.
+  Uses the `K2_TeleportTo` UFunction — server-authoritative, replicates cleanly.
+- **Native-backed `ap.*n` commands** (require `AdmiralsPanelNative.dll`):
+  - `ap.healn <player> <amount>` — heal, clamped to MaxHealth.
+  - `ap.damagen <player> <amount>` — real damage (HP drops).
+  - `ap.killn <player>` — Health = 0.
+  - `ap.feedn <player>` — refill Health + Stamina.
+  - `ap.reviven <player>` — Health = MaxHealth (works on dead players).
+  - `ap.setattrn <player> <attr> <value>` — write any of the ~100 `R5AttributeSet` fields (`MaxHealth`, `Armor`, `Damage`, damage-type multipliers, crit stats, etc.).
+  - `ap.readattrn <player> <attr>` — diagnostic read.
+  - `ap.findn <player>`, `ap.inspectn <player>` — debug helpers used during reverse engineering.
+- [`docs/native-mod.md`](docs/native-mod.md) — full writeup of the GAS reverse engineering, struct layouts, and function surface.
+- `install.ps1` auto-detects `cpp/dist/main.dll` and deploys it to the UE4SS native mods folder with `enabled.txt` + `mods.txt` registration.
+
+### Changed
+
+- All `ap.*n` commands have graceful fallback: if the native DLL isn't installed, they return an explanation instead of crashing.
+- Re-running `install.ps1` remains idempotent; the native step is additive.
+
+### Technical notes
+
+The ApplyDamage / TakeDamage UFunction route was tested and abandoned — Windrose's override returns the damage amount but doesn't actually apply it. Health lives behind `FGameplayAttributeData` (vtable + 2 floats = 16 bytes) on `PlayerState.R5AttributeSet`, discovered via a reflection-based property inspector and unlocked by reinterpreting memory at the right offsets. See `docs/native-mod.md`.
+
 ## [0.1.0] — 2026-04-22
 
 Initial release.

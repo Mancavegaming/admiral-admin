@@ -1,25 +1,27 @@
--- AdmiralsPanel — server-side Lua backend
+-- AdmiralsPanel — server-side Lua backend (v0.2.0)
 -- Adds ap.* RCON commands used by the /admiral/ web panel.
 -- Loaded by WindrosePlus via Mods/admiral-admin/mod.json (main=init.lua).
 --
--- Safe to hot-reload: every handler is pcall-wrapped; persistent state
--- lives on disk, not in module globals.
+-- Two layers of commands:
+--   - Pure Lua: multipliers, presets, announcements, teleport (K2_TeleportTo).
+--   - Native (ap.*n): require the optional AdmiralsPanelNative.dll companion
+--     mod. If it's not installed, those commands return a "not available"
+--     message but nothing crashes.
+--
+-- Safe to hot-reload: every handler is pcall-wrapped; persistent state lives
+-- on disk, not in module globals.
 
 local API    = WindrosePlus.API
 local json   = require("modules.json")
 local Config = require("modules.config")
 
 local MOD_NAME = "AdmiralsPanel"
-local VERSION  = "0.1.0"
+local VERSION  = "0.2.0"
 
 -- ---------------------------------------------------------------------------
 -- Paths
 -- ---------------------------------------------------------------------------
 
--- Our mod file lives at:
---   <gamedir>\R5\Binaries\Win64\ue4ss\Mods\WindrosePlus\Mods\admiral-admin\init.lua
--- Config._path holds the absolute path to windrose_plus.json; strip the
--- filename to get the game directory.
 local function gameDir()
     local ok, p = pcall(function() return Config._path end)
     if not ok or not p then return nil end
@@ -56,7 +58,6 @@ local function readJson(path)
     return data
 end
 
--- Atomic: write to .tmp, os.rename onto final path.
 local function writeJson(path, data)
     local ok, encoded = pcall(json.encode, data)
     if not ok then return false, "encode failed" end
@@ -65,20 +66,16 @@ local function writeJson(path, data)
     if not f then return false, "cannot open tmp file: " .. tmp end
     f:write(encoded)
     f:close()
-    os.remove(path) -- os.rename fails on Windows if target exists
+    os.remove(path)
     local okRename = os.rename(tmp, path)
     if not okRename then return false, "rename failed" end
     return true
 end
 
-local function trim(s)
-    return (s:gsub("^%s+", ""):gsub("%s+$", ""))
-end
+local function trim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
 
 -- ---------------------------------------------------------------------------
--- Player lookup — PlayerController -> PlayerState -> PlayerNamePrivate
--- Mirrors the pattern from the shipped admin.lua (wp.speed) so matching
--- is consistent with the rest of WindrosePlus.
+-- Player lookup
 -- ---------------------------------------------------------------------------
 
 local function pcDisplayName(pc)
@@ -96,7 +93,6 @@ local function pcDisplayName(pc)
     return out
 end
 
--- Returns array of {name, pc, pawn} for all valid PlayerControllers.
 local function listPlayers()
     local out = {}
     local pcs = FindAllOf("PlayerController")
@@ -130,33 +126,26 @@ local function findPlayerByName(name)
 end
 
 -- ---------------------------------------------------------------------------
--- Multipliers
+-- Multipliers (pure Lua)
 -- ---------------------------------------------------------------------------
 
--- JSON key -> { description, ue_property_candidates }
--- UE property names come from Admin._UE4_PROPS in the shipped admin.lua
--- (line 1028-1075). Multiple candidates are tried in order.
 local MULTIPLIERS = {
-    loot            = { desc = "Loot drop multiplier",         ue = {"LootMultiplier"} },
-    xp              = { desc = "XP / experience multiplier",   ue = {"XPMultiplier", "ExperienceMultiplier"} },
-    weight          = { desc = "Carry weight multiplier",      ue = {"WeightMultiplier"} },
-    craft_cost      = { desc = "Crafting cost multiplier",     ue = {"CraftCostMultiplier"} },
-    stack_size      = { desc = "Inventory stack size mult.",   ue = {"StackSizeMultiplier"} },
-    crop_speed      = { desc = "Crop growth speed multiplier", ue = {"CropGrowthMultiplier", "CropSpeedMultiplier"} },
-    cooking_speed   = { desc = "Cooking speed multiplier",     ue = {"CookingSpeedMultiplier", "CookingSpeed"} },
-    inventory_size  = { desc = "Inventory size multiplier",    ue = {"InventorySizeMultiplier"} },
-    points_per_level= { desc = "Skill points per level mult.", ue = {"PointsPerLevelMultiplier"} },
-    harvest_yield   = { desc = "Harvest yield multiplier",     ue = {"HarvestMultiplier", "HarvestYieldMultiplier"} },
+    loot             = { desc = "Loot drop multiplier",         ue = {"LootMultiplier"} },
+    xp               = { desc = "XP / experience multiplier",   ue = {"XPMultiplier", "ExperienceMultiplier"} },
+    weight           = { desc = "Carry weight multiplier",      ue = {"WeightMultiplier"} },
+    craft_cost       = { desc = "Crafting cost multiplier",     ue = {"CraftCostMultiplier"} },
+    stack_size       = { desc = "Inventory stack size mult.",   ue = {"StackSizeMultiplier"} },
+    crop_speed       = { desc = "Crop growth speed multiplier", ue = {"CropGrowthMultiplier", "CropSpeedMultiplier"} },
+    cooking_speed    = { desc = "Cooking speed multiplier",     ue = {"CookingSpeedMultiplier", "CookingSpeed"} },
+    inventory_size   = { desc = "Inventory size multiplier",    ue = {"InventorySizeMultiplier"} },
+    points_per_level = { desc = "Skill points per level mult.", ue = {"PointsPerLevelMultiplier"} },
+    harvest_yield    = { desc = "Harvest yield multiplier",     ue = {"HarvestMultiplier", "HarvestYieldMultiplier"} },
 }
 
--- Range: we don't strictly clamp (user might want extreme event values) but
--- do sanity-check to reject garbage like negatives.
 local function validMultiplierValue(v)
     return type(v) == "number" and v >= 0 and v < 1000
 end
 
--- Try writing value to each candidate UE property on all R5GameMode instances.
--- Returns a list of property names that accepted the write.
 local function applyMultiplierToGame(key, value)
     local spec = MULTIPLIERS[key]
     if not spec then return {} end
@@ -176,20 +165,15 @@ local function applyMultiplierToGame(key, value)
     return applied
 end
 
--- Persist multiplier change to windrose_plus.json + Config.reload()
 local function persistMultiplier(key, value)
     local path = Config._path
     if not path then return false, "Config path unknown" end
-
     local cfg = readJson(path)
     if not cfg then return false, "Cannot read " .. path end
-
     cfg.multipliers = cfg.multipliers or {}
     cfg.multipliers[key] = value
-
     local ok, err = writeJson(path, cfg)
     if not ok then return false, err end
-
     pcall(Config.reload)
     return true
 end
@@ -198,8 +182,6 @@ end
 -- Presets
 -- ---------------------------------------------------------------------------
 
--- Load preset bundles from mod's data/presets.json at every invocation so
--- edits to that file are picked up without a hot-reload.
 local function loadPresets()
     local path = modDir() .. "\\data\\presets.json"
     local presets = readJson(path)
@@ -217,8 +199,6 @@ local function listPresetNames()
     return names
 end
 
--- Apply a preset: iterate its multipliers, persist each, apply to game.
--- Returns a list of human-readable lines to show the admin.
 local function applyPreset(name)
     local presets = loadPresets()
     local p = presets[name]
@@ -233,7 +213,9 @@ local function applyPreset(name)
             local applied = applyMultiplierToGame(key, value)
             if okPersist then
                 anyApplied = true
-                local liveMarker = #applied > 0 and " (live: " .. table.concat(applied, ",") .. ")" or " (saved; applies on restart)"
+                local liveMarker = #applied > 0
+                    and (" (live: " .. table.concat(applied, ",") .. ")")
+                    or  " (saved; applies on restart)"
                 table.insert(lines, string.format("  %s = %s%s", key, tostring(value), liveMarker))
             else
                 table.insert(lines, string.format("  %s = %s — FAILED: %s", key, tostring(value), persistErr or "?"))
@@ -242,19 +224,15 @@ local function applyPreset(name)
             table.insert(lines, "  skipped '" .. key .. "' (unknown key or bad value)")
         end
     end
-
-    if anyApplied then
-        return table.concat(lines, "\n"), nil
-    end
+    if anyApplied then return table.concat(lines, "\n"), nil end
     return nil, "No multipliers were applied (check preset file)"
 end
 
 -- ---------------------------------------------------------------------------
--- Admin action log (persisted to windrose_plus_data/admiral_admin_log.json)
+-- Admin action log
 -- ---------------------------------------------------------------------------
 
 local ADMIN_LOG_MAX = 200
-
 local function adminLogPath()
     local dd = dataDir()
     if not dd then return nil end
@@ -264,35 +242,58 @@ end
 local function appendAdminLog(cmd, args, result)
     local path = adminLogPath()
     if not path then return end
-    local log = readJson(path) or {}
-    if type(log) ~= "table" then log = {} end
-    table.insert(log, {
-        ts = os.time(),
-        cmd = cmd,
-        args = args or {},
-        result = result or "",
+    local logtab = readJson(path) or {}
+    if type(logtab) ~= "table" then logtab = {} end
+    table.insert(logtab, {
+        ts = os.time(), cmd = cmd, args = args or {}, result = result or "",
     })
-    while #log > ADMIN_LOG_MAX do table.remove(log, 1) end
-    pcall(writeJson, path, log)
+    while #logtab > ADMIN_LOG_MAX do table.remove(logtab, 1) end
+    pcall(writeJson, path, logtab)
 end
 
 local function recentAdminLog(limit)
     local path = adminLogPath()
     if not path then return {} end
-    local log = readJson(path) or {}
-    if type(log) ~= "table" then return {} end
-    limit = math.min(limit or 25, #log)
+    local logtab = readJson(path) or {}
+    if type(logtab) ~= "table" then return {} end
+    limit = math.min(limit or 25, #logtab)
     local out = {}
-    for i = math.max(1, #log - limit + 1), #log do
-        table.insert(out, log[i])
+    for i = math.max(1, #logtab - limit + 1), #logtab do
+        table.insert(out, logtab[i])
     end
     return out
 end
 
 -- ---------------------------------------------------------------------------
--- RCON commands
+-- Teleport helpers (pure Lua via K2_TeleportTo UFunction)
 -- ---------------------------------------------------------------------------
 
+local function readPos(char)
+    local ok, loc = pcall(function() return char:K2_GetActorLocation() end)
+    if ok and loc then return loc.X, loc.Y, loc.Z end
+    return nil
+end
+
+local function teleportTo(pawn, x, y, z)
+    return pcall(function()
+        return pawn:K2_TeleportTo({X = x, Y = y, Z = z}, {Pitch = 0, Yaw = 0, Roll = 0})
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Native-DLL wrapper helper (graceful fallback)
+-- ---------------------------------------------------------------------------
+
+local function nativeAvailable(fn_name)
+    local fn = _G[fn_name]
+    return type(fn) == "function", fn
+end
+
+-- ---------------------------------------------------------------------------
+-- Commands
+-- ---------------------------------------------------------------------------
+
+-- MULTIPLIERS
 API.registerCommand("ap.setmult", function(args)
     if #args < 2 then
         local keys = {}
@@ -300,54 +301,43 @@ API.registerCommand("ap.setmult", function(args)
         table.sort(keys)
         return "Usage: ap.setmult <key> <value>\n  keys: " .. table.concat(keys, ", ")
     end
-    local key = args[1]
-    local value = tonumber(args[2])
-    if not MULTIPLIERS[key] then
-        return "Unknown multiplier key: " .. key
-    end
-    if not validMultiplierValue(value) then
-        return "Invalid value (expected number 0..999): " .. tostring(args[2])
-    end
+    local key, value = args[1], tonumber(args[2])
+    if not MULTIPLIERS[key] then return "Unknown multiplier key: " .. key end
+    if not validMultiplierValue(value) then return "Invalid value (0..999): " .. tostring(args[2]) end
 
     local okPersist, persistErr = persistMultiplier(key, value)
     local applied = applyMultiplierToGame(key, value)
-
     local result
     if not okPersist then
         result = "Persist failed: " .. (persistErr or "?")
     elseif #applied == 0 then
-        result = string.format("%s = %s  (saved; applies on next restart — no live property found)", key, tostring(value))
+        result = string.format("%s = %s  (saved; applies on restart)", key, tostring(value))
     else
         result = string.format("%s = %s  (live: %s)", key, tostring(value), table.concat(applied, ", "))
     end
     appendAdminLog("ap.setmult", args, result)
     return result
-end, "Set a world multiplier (live where possible, saved to windrose_plus.json)", "ap.setmult <key> <value>")
+end, "Set a world multiplier", "ap.setmult <key> <value>")
 
 API.registerCommand("ap.preset", function(args)
     if #args < 1 then
         return "Usage: ap.preset <name>\n  presets: " .. table.concat(listPresetNames(), ", ")
     end
-    local name = args[1]
-    local out, err = applyPreset(name)
+    local out, err = applyPreset(args[1])
     local result = out or ("Failed: " .. (err or "?"))
     appendAdminLog("ap.preset", args, err and ("err: " .. err) or "ok")
     return result
 end, "Apply a named multiplier preset", "ap.preset <name>")
 
+-- ANNOUNCE
 API.registerCommand("ap.say", function(args)
-    if #args < 1 then
-        return "Usage: ap.say <message>"
-    end
+    if #args < 1 then return "Usage: ap.say <message>" end
     local msg = trim(table.concat(args, " "))
     if msg == "" then return "(empty message ignored)" end
     log("info", "BROADCAST: " .. msg)
     appendAdminLog("ap.say", args, "logged")
-    -- Note: in-game chat delivery requires calling a UFunction Windrose
-    -- does not yet expose to Lua. This command currently logs only; the
-    -- web panel shows these to operators. See docs/roadmap.md.
-    return "Announced (log-only for now): " .. msg
-end, "Broadcast an announcement to server log / events log", "ap.say <message>")
+    return "Announced (log-only): " .. msg
+end, "Broadcast to server log", "ap.say <message>")
 
 API.registerCommand("ap.bringall", function(args)
     local players = listPlayers()
@@ -373,17 +363,74 @@ API.registerCommand("ap.adminlog", function(args)
     if #entries == 0 then return "(admin log is empty)" end
     local lines = { "Recent admin actions:" }
     for _, e in ipairs(entries) do
-        local argstr = table.concat(e.args or {}, " ")
         table.insert(lines, string.format("  [%s] %s %s -> %s",
-            os.date("%Y-%m-%d %H:%M:%S", e.ts), e.cmd, argstr, e.result))
+            os.date("%Y-%m-%d %H:%M:%S", e.ts), e.cmd,
+            table.concat(e.args or {}, " "), e.result))
     end
     return table.concat(lines, "\n")
 end, "Show recent AdmiralsPanel admin actions", "ap.adminlog [limit]")
 
+-- TELEPORT (pure Lua, server-authoritative via K2_TeleportTo UFunction)
+API.registerCommand("ap.tp", function(args)
+    if #args < 2 then return "Usage: ap.tp <player> <targetPlayer>" end
+    local src = findPlayerByName(args[1])
+    local dst = findPlayerByName(args[2])
+    if not src then return "Source '" .. args[1] .. "' not found" end
+    if not dst then return "Target '" .. args[2] .. "' not found" end
+    local x, y, z = readPos(dst.pawn)
+    if not x then return "Could not read target position" end
+    local ok, err = teleportTo(src.pawn, x, y, z)
+    if ok then
+        local result = string.format("Teleported %s -> %s (%.0f, %.0f, %.0f)", src.name, dst.name, x, y, z)
+        appendAdminLog("ap.tp", args, result)
+        return result
+    end
+    return "Teleport failed: " .. tostring(err)
+end, "Teleport a player to another player", "ap.tp <player> <target>")
+
+API.registerCommand("ap.tpxyz", function(args)
+    if #args < 4 then return "Usage: ap.tpxyz <player> <x> <y> <z>" end
+    local src = findPlayerByName(args[1])
+    if not src then return "Player '" .. args[1] .. "' not found" end
+    local x = tonumber(args[2]); local y = tonumber(args[3]); local z = tonumber(args[4])
+    if not (x and y and z) then return "x/y/z must be numbers" end
+    local ok, err = teleportTo(src.pawn, x, y, z)
+    if ok then
+        local result = string.format("Teleported %s -> (%.0f, %.0f, %.0f)", src.name, x, y, z)
+        appendAdminLog("ap.tpxyz", args, result)
+        return result
+    end
+    return "Teleport failed: " .. tostring(err)
+end, "Teleport player to coordinates", "ap.tpxyz <player> <x> <y> <z>")
+
+-- NATIVE-BACKED commands (require AdmiralsPanelNative.dll)
+local function nativeWrapper(native_fn_name, usage_fmt, logcmd)
+    return function(args)
+        local has, fn = nativeAvailable(native_fn_name)
+        if not has then
+            return "Native feature unavailable (install AdmiralsPanelNative.dll — see cpp/README.md)"
+        end
+        local ok, result = pcall(fn, table.unpack(args))
+        if not ok then return "Call failed: " .. tostring(result) end
+        appendAdminLog(logcmd, args, tostring(result))
+        return tostring(result)
+    end
+end
+
+API.registerCommand("ap.healn",   nativeWrapper("admiralspanel_native_heal",   nil, "ap.healn"),   "Heal a player (native)",      "ap.healn <player> <amount>")
+API.registerCommand("ap.damagen", nativeWrapper("admiralspanel_native_damage", nil, "ap.damagen"), "Damage a player (native)",    "ap.damagen <player> <amount>")
+API.registerCommand("ap.killn",   nativeWrapper("admiralspanel_native_kill",   nil, "ap.killn"),   "Kill a player (native)",      "ap.killn <player>")
+API.registerCommand("ap.feedn",   nativeWrapper("admiralspanel_native_feed",   nil, "ap.feedn"),   "Refill Health + Stamina",     "ap.feedn <player>")
+API.registerCommand("ap.reviven", nativeWrapper("admiralspanel_native_revive", nil, "ap.reviven"), "Set Health to MaxHealth",     "ap.reviven <player>")
+API.registerCommand("ap.setattrn",nativeWrapper("admiralspanel_native_setattr",nil, "ap.setattrn"),"Set any R5AttributeSet field","ap.setattrn <player> <attr> <value>")
+API.registerCommand("ap.readattrn",nativeWrapper("admiralspanel_native_readattr",nil,"ap.readattrn"),"Read any R5AttributeSet field","ap.readattrn <player> <attr>")
+API.registerCommand("ap.findn",   nativeWrapper("admiralspanel_native_find",   nil, "ap.findn"),   "Debug: find pawn by name",    "ap.findn <player>")
+API.registerCommand("ap.inspectn",nativeWrapper("admiralspanel_native_inspect",nil, "ap.inspectn"),"Debug: dump object properties","ap.inspectn <player>")
+
 -- ---------------------------------------------------------------------------
--- Boot message
+-- Boot
 -- ---------------------------------------------------------------------------
 
-log("info", string.format("%s v%s loaded — commands: ap.setmult, ap.preset, ap.say, ap.bringall, ap.adminlog",
+log("info", string.format("%s v%s loaded — pure-Lua: setmult preset say bringall adminlog tp tpxyz; native: heal damage kill feed revive setattr readattr find inspect",
     MOD_NAME, VERSION))
-log("info", "Web panel: http://localhost:<dashboard_port>/admiral.html (once web/ is deployed)")
+log("info", "Web panel: http://localhost:<dashboard_port>/admiral.html")

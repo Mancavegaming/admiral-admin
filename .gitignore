@@ -21,3 +21,11 @@ node_modules/
 
 # Release zips created by CI (kept out of repo)
 admiral-admin-*.zip
+
+# Local C++ build artefacts
+cpp/dist/
+cpp/build/
+*.obj
+*.pdb
+*.exp
+*.lib
