@@ -533,6 +533,35 @@ static int lua_inspect(const LuaMadeSimple::Lua& lua)
     dump_child(found.pawn, STR("CombatComponent"),              "CombatComponent");
     dump_child(found.pawn, STR("GameplayEffectProxyComponent"), "GameplayEffectProxyComponent");
     dump_child(found.pawn, STR("AbilitySystemParams"),          "AbilitySystemParams");
+    // Inventory-adjacent components
+    dump_child(found.pawn,  STR("Equipment"),                   "Equipment");
+    dump_child(found.pawn,  STR("DefaultEquipment"),            "DefaultEquipment");
+    dump_child(found.state, STR("ProximityStorageComponent"),   "ProximityStorageComponent");
+    dump_child(found.state, STR("AmmoComponent"),               "AmmoComponent");
+
+    // DropItemsComponent — path B for give-item (drop on ground, player picks up naturally)
+    dump_child(found.pawn, STR("DropItemsComponent"), "DropItemsComponent");
+
+    // Scan all UObjects for classes containing "Inventory" to find the storage subsystem
+    out += "\nObjects with 'Inventory' in class name (first 30):\n";
+    int inv_count = 0;
+    UObjectGlobals::ForEachUObject([&](UObject* obj, int32, int32) {
+        if (!obj || inv_count >= 30) return inv_count >= 30 ? LoopAction::Break : LoopAction::Continue;
+        auto* cls = obj->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        auto cname = cls->GetName();
+        if (cname.find(STR("Inventory")) == std::wstring::npos &&
+            cname.find(STR("ItemSubsystem")) == std::wstring::npos &&
+            cname.find(STR("ItemStore")) == std::wstring::npos) return LoopAction::Continue;
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "  [%d] %s  (class: %s)\n",
+                      inv_count,
+                      w_to_narrow(obj->GetFullName()).substr(0, 120).c_str(),
+                      w_to_narrow(cname).c_str());
+        out += buf;
+        inv_count++;
+        return LoopAction::Continue;
+    });
 
     // PlayerState hosts R5AttributeSet (where Health lives in this GAS game)
     dump_child(found.state, STR("R5AttributeSet"),            "R5AttributeSet");
