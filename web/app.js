@@ -202,27 +202,91 @@ function renderPlayers() {
         const tr = document.createElement("tr");
         tr.className = "player-row";
         const pos = (p.x !== undefined) ? `${Math.round(p.x)}, ${Math.round(p.y)}, ${Math.round(p.z)}` : "-";
+        // Build TP dropdown: other players only
+        const tpOptions = players
+            .filter(o => o.name !== p.name)
+            .map(o => `<option value="${esc(o.name)}">${esc(o.name)}</option>`)
+            .join("");
         tr.innerHTML = `
             <td class="font-semibold text-gold">${esc(p.name)}</td>
             <td class="font-mono text-xs text-cream/70">${pos}</td>
             <td>
-                <div class="flex items-center gap-3">
+                <div class="flex items-center gap-2">
                     <input type="range" min="0.2" max="5" step="0.1" value="1"
                            class="flex-1 mult-slider" data-player="${esc(p.name)}">
-                    <span class="mult-value text-sm" id="speed-val-${cssSafe(p.name)}">1.0×</span>
+                    <span class="mult-value text-xs" id="speed-val-${cssSafe(p.name)}">1.0×</span>
+                    <button class="row-btn" data-reset-speed="${esc(p.name)}" title="Reset speed to 1×">↺</button>
                 </div>
             </td>
-            <td><button class="btn-primary text-xs" data-reset-speed="${esc(p.name)}">Reset</button></td>
+            <td>
+                <div class="flex flex-wrap gap-1">
+                    <button class="row-btn row-btn-heal"   data-heal="${esc(p.name)}">Heal</button>
+                    <button class="row-btn row-btn-feed"   data-feed="${esc(p.name)}">Feed</button>
+                    <button class="row-btn row-btn-revive" data-revive="${esc(p.name)}">Revive</button>
+                    <button class="row-btn row-btn-kill"   data-kill="${esc(p.name)}">Kill</button>
+                </div>
+            </td>
+            <td>
+                <div class="flex gap-1">
+                    <select class="row-select" data-tp-src="${esc(p.name)}">
+                        <option value="">pick target…</option>
+                        ${tpOptions}
+                    </select>
+                    <button class="row-btn" data-tp-go="${esc(p.name)}">TP</button>
+                </div>
+            </td>
         `;
         tbody.appendChild(tr);
     }
 
+    // Speed slider
     tbody.querySelectorAll("input[type=range]").forEach(sl => {
-        sl.addEventListener("input", e => onSpeedSliderInput(e.target));
+        sl.addEventListener("input", () => onSpeedSliderInput(sl));
     });
     tbody.querySelectorAll("button[data-reset-speed]").forEach(b => {
-        b.addEventListener("click", e => onResetSpeed(b.dataset.resetSpeed));
+        b.addEventListener("click", () => onResetSpeed(b.dataset.resetSpeed));
     });
+
+    // Native actions
+    tbody.querySelectorAll("button[data-heal]").forEach(b => {
+        b.addEventListener("click", () => runNative(`ap.healn ${b.dataset.heal} 100`, `Heal ${b.dataset.heal}`, b));
+    });
+    tbody.querySelectorAll("button[data-feed]").forEach(b => {
+        b.addEventListener("click", () => runNative(`ap.feedn ${b.dataset.feed}`, `Feed ${b.dataset.feed}`, b));
+    });
+    tbody.querySelectorAll("button[data-revive]").forEach(b => {
+        b.addEventListener("click", () => runNative(`ap.reviven ${b.dataset.revive}`, `Revive ${b.dataset.revive}`, b));
+    });
+    tbody.querySelectorAll("button[data-kill]").forEach(b => {
+        b.addEventListener("click", () => {
+            if (!confirm(`Kill ${b.dataset.kill}?`)) return;
+            runNative(`ap.killn ${b.dataset.kill}`, `Kill ${b.dataset.kill}`, b);
+        });
+    });
+
+    // Teleport
+    tbody.querySelectorAll("button[data-tp-go]").forEach(b => {
+        b.addEventListener("click", () => {
+            const src = b.dataset.tpGo;
+            const select = tbody.querySelector(`select[data-tp-src="${cssEscape(src)}"]`);
+            const dst = select && select.value;
+            if (!dst) { toast("Pick a teleport target first", "err"); return; }
+            runNative(`ap.tp ${src} ${dst}`, `TP ${src} → ${dst}`, b);
+        });
+    });
+}
+
+// Run an RCON command, flash the triggering button, surface result via toast.
+async function runNative(cmd, label, btn) {
+    if (btn) { btn.disabled = true; btn.classList.add("row-btn-busy"); }
+    const res = await rcon(cmd);
+    if (btn) { btn.disabled = false; btn.classList.remove("row-btn-busy"); }
+    if (!res) { toast(`${label}: no response`, "err"); return; }
+    const msg = String(res.message || "");
+    const ok = res.status === "ok" && !/unavailable|failed|not found|FAIL/i.test(msg);
+    toast(`${label}: ${msg.slice(0, 80)}`, ok ? "ok" : "err");
+    // Trigger a status re-poll so position / players update
+    pollStatus();
 }
 
 function onSpeedSliderInput(el) {

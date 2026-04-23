@@ -127,6 +127,40 @@ body { background: var(--ink); color: var(--cream); }
 .btn-primary:hover { opacity: 0.85; }
 .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
 
+/* Small row buttons: Heal / Feed / Revive / Kill / Reset / TP */
+.row-btn {
+    background: var(--ink-light);
+    border: 1px solid rgba(212, 160, 74, 0.35);
+    color: var(--cream);
+    padding: 4px 10px;
+    font-size: 0.75rem;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: all 120ms ease;
+}
+.row-btn:hover:not(:disabled)  { border-color: var(--gold); background: rgba(212, 160, 74, 0.12); }
+.row-btn:disabled,
+.row-btn.row-btn-busy          { opacity: 0.5; cursor: wait; }
+.row-btn-heal                  { border-color: rgba(90, 180, 130, 0.5); color: #9fdbb6; }
+.row-btn-heal:hover:not(:disabled)   { border-color: #5ab482; background: rgba(90, 180, 130, 0.15); }
+.row-btn-feed                  { border-color: rgba(200, 160, 90, 0.5); color: #e8cba0; }
+.row-btn-feed:hover:not(:disabled)   { border-color: #c8a05a; background: rgba(200, 160, 90, 0.15); }
+.row-btn-revive                { border-color: rgba(140, 180, 220, 0.5); color: #b8d4ed; }
+.row-btn-revive:hover:not(:disabled) { border-color: #8cb4dc; background: rgba(140, 180, 220, 0.15); }
+.row-btn-kill                  { border-color: rgba(220, 90, 100, 0.5); color: #e8a0a5; }
+.row-btn-kill:hover:not(:disabled)   { border-color: #dc5a64; background: rgba(220, 90, 100, 0.15); }
+
+.row-select {
+    background: var(--ink-light);
+    border: 1px solid rgba(212, 160, 74, 0.25);
+    color: var(--cream);
+    padding: 4px 6px;
+    font-size: 0.75rem;
+    border-radius: 3px;
+    min-width: 100px;
+}
+.row-select:focus { outline: none; border-color: var(--gold); }
+
 /* Player speed slider row */
 .player-row td {
     border-bottom: 1px solid rgba(212, 160, 74, 0.1);

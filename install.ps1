@@ -158,9 +158,22 @@ if (-not (Test-Path -LiteralPath $nativeDll)) {
     if (-not (Test-Path -LiteralPath $nativeDlls)) {
         New-Item -ItemType Directory -Path $nativeDlls -Force | Out-Null
     }
-    Copy-Item $nativeDll (Join-Path $nativeDlls "main.dll") -Force
+    $dstDll = Join-Path $nativeDlls "main.dll"
+    try {
+        Copy-Item $nativeDll $dstDll -Force
+        Write-OK "Deployed main.dll to $nativeDlls"
+    } catch [System.IO.IOException] {
+        # File in use by a running server. Compare hashes; if identical, skip silently.
+        $srcHash = (Get-FileHash $nativeDll -Algorithm SHA256).Hash
+        $dstHash = (Test-Path -LiteralPath $dstDll) -and `
+                   ((Get-FileHash $dstDll -Algorithm SHA256).Hash -eq $srcHash)
+        if ($dstHash) {
+            Write-Info "main.dll already up to date (server is running, can't overwrite)"
+        } else {
+            Write-Warn "main.dll is locked by running server and differs from source. Stop the server and re-run to update."
+        }
+    }
     Set-Content -Path (Join-Path $nativeDir "enabled.txt") -Value "1" -Encoding ASCII -NoNewline
-    Write-OK "Deployed main.dll to $nativeDlls"
 
     # Register in ue4ss\Mods\mods.txt if not already there
     $modsTxt = Join-Path $ue4ssMods "mods.txt"

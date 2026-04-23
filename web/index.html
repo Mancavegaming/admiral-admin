@@ -53,15 +53,20 @@
         <!-- Players -->
         <section id="tab-players" class="tab-panel">
             <h2 class="tab-heading">Online players</h2>
-            <p class="text-sm text-cream/60 mb-4">Speed slider applies live via <code>wp.speed</code>. Changes debounce 500ms.</p>
+            <p class="text-sm text-cream/60 mb-4">
+                Speed slider debounces 500ms. Heal / Feed / Revive / Kill use the native C++ mod
+                (<code>AdmiralsPanelNative.dll</code>) — you'll see a "native unavailable" message
+                if it's not installed. Teleport works via pure Lua (<code>K2_TeleportTo</code>).
+            </p>
             <div id="players-empty" class="text-cream/50 italic py-8">No players online.</div>
             <table id="players-table" class="hidden w-full text-left">
                 <thead class="border-b border-gold/30 text-sm text-cream/60">
                     <tr>
                         <th class="py-2">Name</th>
                         <th class="py-2">Position</th>
-                        <th class="py-2 w-72">Speed</th>
-                        <th class="py-2"></th>
+                        <th class="py-2 w-56">Speed</th>
+                        <th class="py-2">Actions</th>
+                        <th class="py-2">Teleport to</th>
                     </tr>
                 </thead>
                 <tbody id="players-tbody"></tbody>
