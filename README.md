@@ -1,16 +1,22 @@
 # AdmiralsPanel
 
-> An open-source admin panel for Windrose dedicated servers. Built on top of [WindrosePlus](https://github.com/HumanGenome/WindrosePlus).
+> An open-source admin panel for Windrose dedicated servers. **v0.6+ runs
+> standalone**; no WindrosePlus dependency required. Legacy sub-mod install
+> still supported for existing users.
 
-AdmiralsPanel gives you a web UI with buttons, sliders, and presets so you never have to type `wp.speed mancave 1.5` again. Live player list, per-player speed, server multipliers, difficulty presets, announcements, and a raw console fallback.
+AdmiralsPanel gives you a web UI with buttons, sliders, and presets so you never have to type `wp.speed mancave 1.5` again. Live player list, per-player speed, server multipliers, difficulty presets, announcements, heal/feed/kill buttons, item give, and a raw console fallback.
 
 ![screenshot placeholder](docs/screenshots/panel.png)
 
 ## Prerequisites
 
 - A Windrose Dedicated Server install on Windows.
-- [WindrosePlus](https://github.com/HumanGenome/WindrosePlus) v1.0.7 or later, installed and running. (AdmiralsPanel extends it — it does not replace it.)
-- An RCON password set in `windrose_plus.json` (not `changeme`).
+- UE4SS installed in `R5/Binaries/Win64/ue4ss/`.
+- **v0.6+ (standalone, default)**: nothing else required. The native DLL
+  hosts its own HTTP server on port 8790 and auto-generates
+  `admiralspanel.json` with a fresh random password on first run.
+- **v0.5 and earlier (or `-WithWindrosePlus` install)**: [WindrosePlus](https://github.com/HumanGenome/WindrosePlus)
+  v1.0.7+ installed and running; RCON password set in `windrose_plus.json`.
 
 ## Install
 
@@ -22,14 +28,23 @@ cd admiral-admin
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-The installer:
+Standalone install (default):
 
 1. Finds your Windrose server directory (or use `-GameDir "C:\path\to\server"`).
-2. Copies the Lua mod into `R5\Binaries\Win64\ue4ss\Mods\WindrosePlus\Mods\admiral-admin\`.
-3. Copies the web panel into `windrose_plus\server\web\admiral\`.
-4. If `cpp\dist\main.dll` exists (either prebuilt from a release or built via `cpp\build.ps1`), deploys it to `R5\Binaries\Win64\ue4ss\Mods\AdmiralsPanelNative\` with `enabled.txt` + `mods.txt` registration. Skips gracefully otherwise.
+2. Installs the Lua mod at `R5\Binaries\Win64\ue4ss\Mods\AdmiralsPanel\`.
+3. Installs the web panel at `admiralspanel_data\web\` (served by the native HTTP server).
+4. Installs `main.dll` (native HTTP server + UFunction bridge) at `R5\Binaries\Win64\ue4ss\Mods\AdmiralsPanelNative\`.
+5. First server start writes `admiralspanel.json` with a random password. Log in at **<http://localhost:8790/>**.
 
-Re-running is safe — everything is idempotent.
+Sub-mod install (legacy, under WindrosePlus):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -WithWindrosePlus
+```
+
+Drops into `WindrosePlus\Mods\admiral-admin\` and serves via WP's dashboard at `http://localhost:8780/admiral.html`. Use this if you already run WindrosePlus and want everything in one place.
+
+Re-running is safe in either mode — idempotent.
 
 ### Getting the native DLL
 

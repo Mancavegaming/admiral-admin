@@ -7,6 +7,7 @@
 - **v0.3 (2026-04-23)** — Attributes tab, per-player row actions, live stat bars, multi-set attribute access (Posture, Comfort, RangeWeapon).
 - **v0.4 (2026-04-23)** — Random-loot give: `ap.giveloot` teleports populated loot actors, auto-pickup delivers whatever they hold. Plus a reverse-engineering toolkit (`ap.scan`, `ap.rawdumpn`, `ap.dumpclassn`, etc.).
 - **v0.5 (2026-04-24)** — Specific-item give: `ap.giveitem <player> <search>` identifies items in populated loot actors by scanning LootView memory for references to known `UR5BLInventoryItem` data assets. Supporting commands: `ap.lootitems`, `ap.itemlist`, `ap.itemscan`.
+- **v0.6 (2026-04-24)** — Standalone mode. AdmiralsPanel no longer requires WindrosePlus. Native DLL hosts its own HTTP server (port 8790), session/login, and RCON dispatch. Standalone UE4SS Lua mod with own command registry + spool poller. Legacy sub-mod install still supported via `install.ps1 -WithWindrosePlus`.
 
 See [CHANGELOG.md](../CHANGELOG.md) for the full feature list per release.
 

@@ -1,31 +1,64 @@
--- AdmiralsPanel — server-side Lua backend (v0.2.0)
+-- AdmiralsPanel — server-side Lua backend.
 -- Adds ap.* RCON commands used by the /admiral/ web panel.
--- Loaded by WindrosePlus via Mods/admiral-admin/mod.json (main=init.lua).
 --
--- Two layers of commands:
---   - Pure Lua: multipliers, presets, announcements, teleport (K2_TeleportTo).
---   - Native (ap.*n): require the optional AdmiralsPanelNative.dll companion
---     mod. If it's not installed, those commands return a "not available"
---     message but nothing crashes.
---
--- Safe to hot-reload: every handler is pcall-wrapped; persistent state lives
--- on disk, not in module globals.
+-- Loads in two modes:
+--   1. Sub-mod of WindrosePlus: WindrosePlus.API is set by WP before we run.
+--      Entry: Mods/admiral-admin/mod.json (main=init.lua).
+--   2. Standalone UE4SS mod (v0.6+): Scripts/main.lua sets AdmiralsPanel.API
+--      then dofile()s this init.lua. No WindrosePlus dependency.
+-- Either way, the `API` local below is the same interface.
 
-local API    = WindrosePlus.API
-local json   = require("modules.json")
-local Config = require("modules.config")
+local API
+if AdmiralsPanel and AdmiralsPanel.API then
+    API = AdmiralsPanel.API   -- standalone mode (v0.6+)
+elseif WindrosePlus and WindrosePlus.API then
+    API = WindrosePlus.API    -- sub-mod mode (legacy)
+else
+    error("AdmiralsPanel: no API available — neither WindrosePlus.API nor AdmiralsPanel.API set")
+end
+
+-- JSON + Config modules. Under WindrosePlus these live at
+-- WindrosePlus/Scripts/modules. Under standalone we ship a local json
+-- (ap_json) and skip Config (multiplier persistence handled natively).
+local json, Config
+do
+    local ok_j, j = pcall(require, "modules.json")
+    if ok_j then json = j
+    else
+        local ok2, j2 = pcall(require, "ap_json")
+        json = ok2 and j2 or nil
+    end
+    local ok_c, c = pcall(require, "modules.config")
+    Config = ok_c and c or nil
+end
 
 local MOD_NAME = "AdmiralsPanel"
-local VERSION  = "0.5.0"
+local VERSION  = "0.6.0"
 
 -- ---------------------------------------------------------------------------
 -- Paths
 -- ---------------------------------------------------------------------------
 
 local function gameDir()
-    local ok, p = pcall(function() return Config._path end)
-    if not ok or not p then return nil end
-    return p:match("^(.*)[\\/][^\\/]+$")
+    if Config then
+        local ok, p = pcall(function() return Config._path end)
+        if ok and p then return p:match("^(.*)[\\/][^\\/]+$") end
+    end
+    -- Standalone: UE4SS cwd is <game>\R5\Binaries\Win64. Walk up 3 levels
+    -- to reach the game root.
+    local ok, c = pcall(function()
+        local f = io.popen("cd")
+        if not f then return nil end
+        local s = f:read("*l")
+        f:close()
+        return s
+    end)
+    if not (ok and c and c ~= "") then return nil end
+    for _ = 1, 3 do
+        local parent = c:match("^(.+)[\\/][^\\/]+$")
+        if parent and parent ~= "" then c = parent end
+    end
+    return c
 end
 
 local function modDir()
@@ -37,7 +70,10 @@ end
 local function dataDir()
     local gd = gameDir()
     if not gd then return nil end
-    return gd .. "\\windrose_plus_data"
+    if Config then
+        return gd .. "\\windrose_plus_data"   -- sub-mod: share WP's data dir
+    end
+    return gd .. "\\admiralspanel_data"       -- standalone: our own
 end
 
 local ADMIN_LOG_NAME = "admiral_admin_log.json"
@@ -166,15 +202,21 @@ local function applyMultiplierToGame(key, value)
 end
 
 local function persistMultiplier(key, value)
-    local path = Config._path
-    if not path then return false, "Config path unknown" end
+    local path
+    if Config and Config._path then
+        path = Config._path
+    else
+        local gd = gameDir()
+        if not gd then return false, "game dir unknown" end
+        path = gd .. "\\admiralspanel.json"
+    end
     local cfg = readJson(path)
     if not cfg then return false, "Cannot read " .. path end
     cfg.multipliers = cfg.multipliers or {}
     cfg.multipliers[key] = value
     local ok, err = writeJson(path, cfg)
     if not ok then return false, err end
-    pcall(Config.reload)
+    if Config and Config.reload then pcall(Config.reload) end
     return true
 end
 
