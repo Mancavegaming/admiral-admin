@@ -4,6 +4,79 @@ All notable changes to this project will be documented in this file. Format is l
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-04-23
+
+The give-item unlock.
+
+### Added
+
+- **`ap.giveloot <player> [count]`** — teleports up to `count` populated
+  `R5LootActor` instances from the world to the player. The player's
+  `R5Ability_Loot_AutoPickup` auto-collects them on proximity. Delivers
+  whatever items are already on those loot actors (fiber, wood, food,
+  depending on what mobs have died / resources broken).
+- **`ap.yankactorn <player> <full_path>`** — teleport any actor (by full
+  UObject path) to a player. Generic primitive.
+- **`ap.spawnn <player> <class_path> [dx dy dz]`** — spawns any Actor
+  subclass at player location + offset, using manual ProcessEvent with
+  correctly-sized params buffers for `BeginDeferredActorSpawnFromClass` +
+  `FinishSpawningActor`. Works for vanilla actors (tested with
+  `/Script/Engine.StaticMeshActor`). **Does NOT work** for BP-derived
+  pickups like `BP_WaterPickup_*_C` — their construction scripts crash
+  `FinishSpawningActor` (likely `R5FoliageMeshComponent` init requires a
+  world context the dedicated server doesn't have at arbitrary spawn
+  points).
+- **Reverse-engineering toolkit** — six new diagnostic commands:
+  - `ap.rawdumpn <target> [bytes]` — hex+ASCII dump of a UObject's raw
+    memory. Target can be a class short name (finds first live instance)
+    or a full path. Used to decode non-reflected C++ field layouts.
+  - `ap.dumpclassn <classname> [N]` — list first N live instances of a
+    class with their addresses + paths.
+  - `ap.funcparamsn <func_path>` — dump a UFunction's parameter layout
+    (name / offset / size / type). Used to verify reflected param struct
+    sizes when UE4SS's hardcoded wrappers are wrong for the build.
+  - `ap.locn <player>` — print a player's world location.
+  - `ap.findclassn <path>` — resolve a full object path, report class-of
+    and address.
+  - `ap.scanpath <substring>` — scan UObject full-paths (not just class
+    names) for a substring. Finds assets under `/Game/...`, UFunctions
+    by path like `Class:Function`, etc.
+  - `ap.lootlistn [N]` — list populated R5LootActor instances in the
+    world (those with non-null `LootView`).
+  - `ap.lootinspectn [bytes]` — find the first populated R5LootActor and
+    hex-dump its `R5BLActor_DropView` memory. Used in give-item RE.
+
+### Changed
+
+- **`ap.scan`** now matches both the object's own name AND the class
+  name of its instances. Previously only matched by instance class,
+  which missed UClass / UScriptStruct / UFunction definitions when
+  searching by name.
+- `ap.classprobe` falls back to a full UObject scan when the four
+  hardcoded `/Script/...` package prefixes don't resolve the class.
+  Classes in packages like `/Script/R5DataKeepers.`,
+  `/Script/R5ActionManager.` now resolve automatically.
+
+### Technical notes on give-item (deferred sub-work — task #22)
+
+Full writeup in [`docs/native-mod.md`](docs/native-mod.md). Short version:
+Windrose's inventory is rule-based (`R5BLInventory_AddItemsRule` + params
+struct `R5BLInventory_AddItems` containing `FR5BLReward` containing
+`TArray<R5BLItemsStackData>`) — but **rules are invoked via a C++-only
+dispatcher, not reflected UFunctions**. We mapped every level of the
+data structure (confirmed via `classprobe`) but none of the invoke paths
+are callable from UE4SS-C++ without pattern-scanning the game binary.
+
+The working give-item path uses existing world-spawned `R5LootActor`
+instances (populated by mob deaths / resource breaks) and teleports
+them to the player; auto-pickup delivers. Specific-item targeting would
+require parsing the `R5BLActor_DropView`'s non-reflected internal
+structure (5 levels of pointer chasing: DropView → slot map →
+SlotView → FR5BLItem → TSoftObjectPtr<UR5BLInventoryItem>). Deferred
+until the DropView layout is empirically decoded.
+
+
+
 ## [0.3.1] — 2026-04-23
 
 ### Added

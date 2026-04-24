@@ -65,11 +65,13 @@ Two options:
 
 - `ap.healn` / `ap.damagen` / `ap.killn` / `ap.feedn` / `ap.reviven` — real health mods via direct GAS attribute writes (server-authoritative, replicates to clients).
 - `ap.setattrn` / `ap.readattrn` — touch any of the ~100 `R5AttributeSet` fields (MaxHealth, Armor, Damage, all damage-type multipliers, crit stats, etc.). "God mode" and "500 damage/hit" are one command each.
-- See [`docs/native-mod.md`](docs/native-mod.md) for the technical writeup.
+- `ap.giveloot <player> [count]` — teleport populated `R5LootActor` instances in the world to a player; auto-pickup delivers their contents (fiber, wood, food, etc. — whatever was in the loot actor).
+- `ap.yankactorn` / `ap.spawnn` / `ap.lootlistn` / `ap.lootinspectn` and a full RE toolkit (`rawdumpn` / `dumpclassn` / `funcparamsn` / `scanpath` / `findclassn` / `locn`) for further reverse-engineering.
+- See [`docs/native-mod.md`](docs/native-mod.md) for the technical writeup, including the give-item architecture and what's needed for specific-item targeting.
 
-**Still not done** (v0.3 roadmap):
+**Still not done** (v0.4 roadmap):
 
-- Give-item / drop-item — need another inspector pass on `Equipment` / `InventoryView`.
+- Specific-item give (`ap.giveitem Mancave bread`) — `ap.giveloot` delivers random loot; specific-item requires parsing the `R5BLActor_DropView` non-reflected memory to identify what each loot actor holds. Partially mapped; deferred.
 - In-game chat broadcast — `ClientMessage` is an RPC and UE4SS struggles with it. Looking for a non-RPC path.
 - UI buttons for the native commands — right now they work via the dashboard console only.
 
