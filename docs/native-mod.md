@@ -40,7 +40,7 @@ All of these live in whichever Lua state loaded the mod (registered in `on_lua_s
 
 | Lua global                            | Arguments                     | Returns (string)                                       |
 |---------------------------------------|-------------------------------|--------------------------------------------------------|
-| `admiralspanel_native_version()`      | —                             | `"0.2.0"`                                              |
+| `admiralspanel_native_version()`      | —                             | `"0.5.0"`                                              |
 | `admiralspanel_native_find(name)`     | player name                   | `"found: <pawn full name>"` or `"not found"`           |
 | `admiralspanel_native_inspect(name)`  | player name                   | Dumps R5Character + HealthComponent + R5AttributeSet + a few other classes with offsets and CPP types — big output |
 | `admiralspanel_native_heal(name, amt)`   | name, float                | `"Health X -> Y (max Z) OK"`                           |
@@ -95,11 +95,14 @@ If a Windrose patch breaks it: run `ap.inspectn <player>` with an updated inspec
 
 ## Roadmap additions
 
-### Give-item — partial solution shipped in v0.4.0
+### Give-item — random-loot variant shipped in v0.4.0
 
 **Working path**: `ap.giveloot <player> [count]` teleports up to `count`
 populated `R5LootActor` instances from the world to the player. The
 player's `R5Ability_Loot_AutoPickup` auto-collects them on proximity.
+Superseded for targeting use cases by `ap.giveitem` in v0.5.0 — keep
+`ap.giveloot` when you want a quick bulk fetch of whatever's lying
+around, use `ap.giveitem` when you want to hand over a specific item.
 
 **How it works**:
 
@@ -121,54 +124,83 @@ Mancave 3x Bread"). We get whatever that specific loot actor held — in
 testing, fiber, logs, plant fiber. For hunger-admin use cases you'd want
 to target food specifically — see *deferred work* below.
 
-### Give-item — specific-item targeting (deferred — task #22)
+### Give-item — source-class matching (shipped v0.5.0 — task #22)
 
-Full reverse-engineering of the inventory rule chain was done. Findings:
+**Working commands**: `ap.giveitem`, `ap.lootitems`, `ap.itemlist`, `ap.itemscan`, `ap.lootslots`.
 
-- Windrose inventory is **rule-based**. Actual item storage lives in a
-  central subsystem (not exposed), accessed via `R5BLInventory_AddItemsRule`
-  with params struct `R5BLInventory_AddItems`:
-  ```
-  R5BLInventory_AddItems (0x28):
-    +0x00 InventoriesPaths : TArray (targets)
-    +0x10 Reward : FR5BLReward
-    +0x20 bShouldAddAllItems : bool
-    +0x21 bDropExtraItems : bool
-  FR5BLReward (0x10):
-    +0x00 ItemsStacks : TArray<R5BLItemsStackData>
-  R5BLItemsStackData (0x60):
-    +0x00 Item : FR5BLItem
-    +0x58 Count : int32
-  FR5BLItem (0x58):
-    +0x00 ItemParams : TSoftObjectPtr<UR5BLInventoryItem>   <- the actual item def
-    +0x28 Attributes : TArray
-    +0x38 ItemId : FR5BLRecordId
-    +0x48 Effects : TArray
-  ```
-- The rule dispatcher is **C++-only, not reflected**. No
-  `R5BLInventory_AddItemsRule:Apply` or equivalent UFunction exists on
-  any R5 class. Scanned `R5BLInventoryView:`, `R5BLInventory_AddItemsRule:`,
-  `R5DataKeeperForServerCoop:` — all returned zero UFunctions.
-- `R5BLActor_PickupResource_AddDynamicRule` and the entire
-  `R5BusinessRules` rule tree share this architecture.
-- **`R5BLActor_DropView` (the LootView type) also has 0 UPROPERTYs**. Its
-  state is held in non-reflected C++ fields — raw memory dump shows a
-  complex per-slot structure with record IDs, FName entries, and
-  multiple nested pointers (not a flat TArray). 5 levels of
-  pointer chasing needed: DropView → slot map → SlotView → FR5BLItem →
-  TSoftObjectPtr → UR5BLInventoryItem.
-- **Actor spawning works for vanilla UE classes** (`StaticMeshActor`
-  tested OK) but **crashes on BP pickup classes** like
-  `BP_WaterPickup_S1_Barrel_C` — the BP's construction script
-  (`R5FoliageMeshComponent` init) can't run cleanly on the dedicated
-  server without a foliage-system world context.
+We explored two approaches before landing on the shipped one:
 
-Realistic path for specific-item give: 1-2 more sessions of memory
-reverse-engineering to decode the DropView's slot map, then a
-`ap.giveitem <player> <search>` that scans all live LootViews and yanks
-the one containing a matching item. Alternative: wait for UE4SS's
-UHT dumper output on a client to reveal any previously-hidden UFunction
-signatures that might include the rule executor.
+1. **Decode `R5BLActor_DropView`'s slot chain**: abandoned — DropView slots
+   don't contain direct item references. The chain is opaque from reflection.
+2. **Scan LootView memory for `UR5BLInventoryItem` pointers / InternalIndex
+   values**: tested empirically. Didn't find matches on live DropViews —
+   the game's central inventory subsystem keeps item refs in a private
+   table keyed by record IDs (strings like `622DBF23...|I|7|I|13650`)
+   that isn't serialized through DropView memory.
+
+**Shipped approach — source-class matching**:
+
+1. The DropView's memory holds pointers to source-related UObjects. For
+   tree drops, these are the source tree's `StaticMeshComponent`s at
+   `LootView+0x180` (an 11-element pointer array). For other drop types
+   it's a different layout.
+2. We walk the DropView's `+0x28..+0x2C0` region looking for UObject-shaped
+   pointers, validated against a snapshot of the live UObject table
+   (`gather_live_uobjects`). This gives us crash-safe dereferencing — we
+   never call virtual methods on random memory.
+3. For each valid candidate, we walk its `Outer` chain (up to 6 hops)
+   skipping generic container classes (`World`, `Level`, `GameEngine`,
+   `R5BLIslandView`, `R5GOS_*`, etc) until we hit a specific source class.
+4. If any candidate resolves to a non-generic class whose name matches the
+   user's search (substring, case-insensitive), teleport that loot actor
+   to the player's feet (offset 80cm ahead, 80cm down so it's outside the
+   player capsule and auto-pickup can magnet it).
+5. **Fallback**: if no candidate matches, teleport a random populated
+   loot actor — same delivery mechanism as `ap.giveloot`.
+
+### Coverage
+
+- Confirmed to work for tree drops (Ficus, Palm variants).
+- Doesn't work for gatherables (record-ID suffix `|GA|`) or drop types
+  where the Outer chain only hits generic containers. Those fall through
+  to the random-loot fallback.
+- **Full coverage** would require finding the C++ rule dispatcher via
+  pattern-scanning the game binary — see `project_giveitem_future_work`
+  memory note. Deferred; not needed for v1 of the feature.
+
+**Rule-system background (for anyone extending this)**: Windrose inventory
+is rule-based. Direct add goes through `R5BLInventory_AddItemsRule` with
+params struct `R5BLInventory_AddItems`:
+```
+R5BLInventory_AddItems (0x28):
+  +0x00 InventoriesPaths : TArray (targets)
+  +0x10 Reward : FR5BLReward
+  +0x20 bShouldAddAllItems : bool
+  +0x21 bDropExtraItems : bool
+FR5BLReward (0x10):
+  +0x00 ItemsStacks : TArray<R5BLItemsStackData>
+R5BLItemsStackData (0x60):
+  +0x00 Item : FR5BLItem
+  +0x58 Count : int32
+FR5BLItem (0x58):
+  +0x00 ItemParams : TSoftObjectPtr<UR5BLInventoryItem>
+  +0x28 Attributes : TArray
+  +0x38 ItemId : FR5BLRecordId
+  +0x48 Effects : TArray
+```
+— but the rule dispatcher is C++-only (no reflected UFunction executes a
+rule). `R5BLInventory_AddItemsRule`, every `R5BL*View` class, and
+`R5DataKeeperForServerCoop` all expose 0 UFunctions. Pattern-scanning the
+game binary for the rule executor would unlock unconstrained
+give-item-with-count, but wasn't needed for the shipped feature.
+
+**BP pickup spawn (still broken)**: `BP_WaterPickup_*_C` classes crash in
+`FinishSpawningActor` inside their construction script — the
+`R5FoliageMeshComponent` init can't complete without a foliage-system
+world context on the dedicated server. Vanilla UE classes
+(`StaticMeshActor`) spawn cleanly, proving the spawn primitive is sound.
+If we ever need to *create* populated loot actors (as opposed to re-using
+ones the world already produced), this is the remaining blocker.
 
 ### Chat broadcast
 

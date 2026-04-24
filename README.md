@@ -66,14 +66,16 @@ Two options:
 - `ap.healn` / `ap.damagen` / `ap.killn` / `ap.feedn` / `ap.reviven` — real health mods via direct GAS attribute writes (server-authoritative, replicates to clients).
 - `ap.setattrn` / `ap.readattrn` — touch any of the ~100 `R5AttributeSet` fields (MaxHealth, Armor, Damage, all damage-type multipliers, crit stats, etc.). "God mode" and "500 damage/hit" are one command each.
 - `ap.giveloot <player> [count]` — teleport populated `R5LootActor` instances in the world to a player; auto-pickup delivers their contents (fiber, wood, food, etc. — whatever was in the loot actor).
-- `ap.yankactorn` / `ap.spawnn` / `ap.lootlistn` / `ap.lootinspectn` and a full RE toolkit (`rawdumpn` / `dumpclassn` / `funcparamsn` / `scanpath` / `findclassn` / `locn`) for further reverse-engineering.
-- See [`docs/native-mod.md`](docs/native-mod.md) for the technical writeup, including the give-item architecture and what's needed for specific-item targeting.
+- `ap.giveitem <player> <search>` — teleport a populated loot actor whose contents match `search` (e.g. `ap.giveitem Mancave banana`). Scans each LootView's memory for references to known `UR5BLInventoryItem` data assets; substring-matches on the short name. Pair with `ap.lootitems` to see what's available in the world first, or `ap.itemlist <search>` to see what items exist at all.
+- `ap.yankactorn` / `ap.spawnn` / `ap.lootlistn` / `ap.lootinspectn` / `ap.itemscan` and a full RE toolkit (`rawdumpn` / `dumpclassn` / `funcparamsn` / `scanpath` / `findclassn` / `locn`) for further reverse-engineering.
+- See [`docs/native-mod.md`](docs/native-mod.md) for the technical writeup, including how `ap.giveitem` identifies items without decoding the DropView's non-reflected slot structure.
 
-**Still not done** (v0.4 roadmap):
+**Still not done** (v0.5 roadmap):
 
-- Specific-item give (`ap.giveitem Mancave bread`) — `ap.giveloot` delivers random loot; specific-item requires parsing the `R5BLActor_DropView` non-reflected memory to identify what each loot actor holds. Partially mapped; deferred.
 - In-game chat broadcast — `ClientMessage` is an RPC and UE4SS struggles with it. Looking for a non-RPC path.
+- Give-item with an arbitrary count / arbitrary item (not just what's currently in the world). Would require decoding the C++-only rule dispatcher — pattern-scanning the game binary, multi-session RE.
 - UI buttons for the native commands — right now they work via the dashboard console only.
+- Scheduled server actions (cron-style restarts, timed multiplier swaps, etc.).
 
 ## How it works
 

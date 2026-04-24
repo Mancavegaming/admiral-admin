@@ -4,6 +4,74 @@ All notable changes to this project will be documented in this file. Format is l
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-04-24
+
+The specific-item-give unlock.
+
+### Added
+
+- **`ap.giveitem <player> <search>`** — teleports a populated `R5LootActor`
+  whose *source-actor class* matches `search` (case-insensitive substring).
+  Sources are things like `BP_Segment_Coast_Jungle_Ficus_1200cm_C`, so
+  `ap.giveitem Mancave ficus` grabs a Ficus-tree drop. When no specific
+  source matches the search (gatherables and some drop types don't expose
+  their source through DropView memory), the command falls back to
+  teleporting a random populated loot actor — so it always delivers
+  *something* when there's loot in the world.
+- **`ap.lootitems [N]`** — list the first N populated `R5LootActor`s with
+  their identified source class (or `<unknown source>` if we can't
+  determine it). Use before `ap.giveitem` to see what's targetable.
+- **`ap.itemlist [search]`** — browse known `UR5BLInventoryItem` data
+  assets (~1200 of them, filter by substring like `ap.itemlist banana`).
+  Informational only — we can't materialize arbitrary items from this
+  list, but it's useful for knowing what the game has.
+- **`ap.itemscan <target> [bytes]`** / **`ap.lootslots [N]`** —
+  reverse-engineering helpers. Scan an object's raw memory for item
+  references, or hex-dump slot structs of the first populated loot actor.
+
+### How it works
+
+Windrose loot-actor inventory data lives in a central C++ subsystem keyed
+by record IDs (opaque strings like `622DBF23...|I|7|I|13650`) that isn't
+reachable from DropView memory through reflected UFunctions. Rather than
+decoding the private table, `ap.giveitem` identifies drops by the BP class
+that produced them:
+
+1. The DropView's memory holds pointers to source-related UObjects (for
+   tree drops, these are the source tree's `StaticMeshComponent`s at
+   `LootView+0x180`).
+2. We validate every dereferenced pointer against a snapshot of the live
+   UObject table (`gather_live_uobjects`), so we never call virtual
+   methods on random memory.
+3. For each valid candidate pointer, we walk the `Outer` chain up to 6
+   hops, skipping generic container classes (`World`, `Level`,
+   `GameEngine`, `R5BLIslandView`, `R5GOS_*`, etc) until we hit a
+   specific source class.
+
+### Coverage
+
+- **Works for most tree/resource-break drops** — Ficus, Palm, and similar
+  `BP_Segment_*` classes have a mesh-component chain that resolves cleanly.
+- **Fallback path for everything else** — gatherables (record-ID suffix
+  `|GA|`), mob kills, chest drops, and any loot-actor layout where the
+  source-actor can't be reached from DropView memory fall back to the
+  random-loot path. This is the same delivery mechanism as `ap.giveloot`
+  — it still teleports one real populated drop to the player.
+- **Crash-safe** — every pointer we dereference is validated against the
+  live UObject table before we call any virtual method on it.
+- **Post-teleport position** — loot drops 80cm ahead of the player at
+  foot level (Z-80), not inside the player capsule, so auto-pickup can
+  actually magnet it in.
+
+### Known limitations
+
+- Perfect source identification would require pattern-scanning the game
+  binary to find the C++ rule dispatcher. Deferred; see
+  `docs/native-mod.md` for the roadmap.
+- "Give me *exactly* 10 bananas" with no tree currently broken is still
+  not possible — the feature works with drops already in the world, not
+  arbitrary item spawning.
+
 ## [0.4.0] — 2026-04-23
 
 The give-item unlock.
