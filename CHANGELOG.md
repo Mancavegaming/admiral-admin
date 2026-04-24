@@ -4,6 +4,59 @@ All notable changes to this project will be documented in this file. Format is l
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-04-24
+
+Standalone mode — AdmiralsPanel no longer requires WindrosePlus.
+
+### Added
+
+- **Native-hosted HTTP server** on port 8790 (configurable via
+  `admiralspanel.json`). Serves the web panel, login flow, and `/api/rcon`
+  endpoint directly from `AdmiralsPanelNative.dll` via Winsock2. Session
+  cookies, password login, and static file serving all implemented in
+  the DLL — zero runtime dependencies beyond the Winsock stack.
+- **Standalone UE4SS Lua mod** at `R5/Binaries/Win64/ue4ss/Mods/AdmiralsPanel/`.
+  Defines its own command registry (`AdmiralsPanel.API`) that mirrors the
+  subset of `WindrosePlus.API` we used (`log`, `registerCommand`). Runs
+  under the standard UE4SS mod loader — no WindrosePlus required.
+- **Command-spool bridge** — the native HTTP server writes
+  `cmd_<id>.json` files into `admiralspanel_data/rcon/`; the Lua mod's
+  `LoopAsync` poller dispatches them through the registered handlers and
+  writes `res_<id>.json` back. Same pattern WindrosePlus used, our own
+  implementation and spool directory.
+- **`admiralspanel.json`** auto-generated on first run at the server root,
+  containing a randomly-generated 24-char password + HTTP port. No config
+  file was required under WindrosePlus because we leaned on theirs.
+- **`install.ps1` defaults to standalone mode**. Pass `-WithWindrosePlus`
+  for the legacy sub-mod install path (still supported for users who
+  already run WP).
+
+### Changed
+
+- `mod/init.lua` detects which API is active (`AdmiralsPanel.API` for
+  standalone, `WindrosePlus.API` for sub-mod) and routes through the
+  appropriate command registrar. The same code now runs in both modes.
+- Multiplier persistence (`ap.setmult`) writes to `admiralspanel.json`
+  in standalone mode; continues to write to `windrose_plus.json` in
+  sub-mod mode.
+
+### Migration from v0.5
+
+- Existing WindrosePlus sub-mod installs keep working untouched. To switch
+  to standalone, run `install.ps1` without flags and optionally remove
+  `ue4ss/Mods/WindrosePlus/Mods/admiral-admin/` after verifying the new
+  setup works.
+- The RCON password for standalone mode is separate from WindrosePlus's —
+  check `admiralspanel.json` for the generated value (or set your own).
+
+### Ports
+
+- Sub-mod mode: `http://localhost:8780/admiral.html` (via WP dashboard)
+- Standalone mode: `http://localhost:8790/` (our own HTTP server)
+
+Both modes can run simultaneously during migration — they use separate
+spool directories and don't conflict.
+
 ## [0.5.0] — 2026-04-24
 
 The specific-item-give unlock.

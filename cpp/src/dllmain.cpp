@@ -26,6 +26,10 @@
 
 #include <Mod/CppUserModBase.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
+
+#include "http_server.hpp"
+#include "ap_app.hpp"
+#include "ap_config.hpp"
 #include <LuaMadeSimple/LuaMadeSimple.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 #include <Unreal/UObject.hpp>
@@ -2438,13 +2442,37 @@ public:
     AdmiralsPanelNative() : CppUserModBase()
     {
         ModName = STR("AdmiralsPanel-Native");
-        ModVersion = STR("0.5.0");
-        ModDescription = STR("Native UFunction bridge for AdmiralsPanel");
+        ModVersion = STR("0.6.0");
+        ModDescription = STR("Native UFunction bridge + standalone HTTP server for AdmiralsPanel");
         ModAuthors = STR("Mancavegaming");
-        Output::send<LogLevel::Verbose>(STR("[AdmiralsPanel-Native] loaded (v0.5.0)\n"));
+        Output::send<LogLevel::Verbose>(STR("[AdmiralsPanel-Native] loaded (v0.6.0)\n"));
+
+        // v0.6 standalone mode: load config, start our own HTTP server +
+        // session + spool bridge. Running alongside WindrosePlus on port
+        // 8790 during the migration window.
+        std::string gd = ap_cfg::discover_game_dir();
+        ap_cfg::load(gd);
+        const auto& cfg = ap_cfg::get();
+
+        if (m_app.start()) {
+            Output::send<LogLevel::Verbose>(
+                STR("[AdmiralsPanel-Native] HTTP server listening on :{}\n"),
+                cfg.http_port);
+        } else {
+            Output::send<LogLevel::Warning>(
+                STR("[AdmiralsPanel-Native] HTTP server failed to bind :{}\n"),
+                cfg.http_port);
+        }
     }
 
-    ~AdmiralsPanelNative() override = default;
+    ~AdmiralsPanelNative() override
+    {
+        m_app.stop();
+    }
+
+private:
+    ap_app::App m_app;
+public:
 
     auto on_lua_start(StringViewType mod_name,
                       LuaMadeSimple::Lua& lua,
