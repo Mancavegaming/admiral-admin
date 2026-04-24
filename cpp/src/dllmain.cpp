@@ -4,12 +4,25 @@
 // v0.2 — first real admin actions. Calls UGameplayStatics::ApplyDamage via ProcessEvent
 // (server-authoritative; synthesizes a valid FDamageEvent internally).
 
+#include <cmath>
 #include <cwctype>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 
 #include <Mod/CppUserModBase.hpp>
 #include <DynamicOutput/DynamicOutput.hpp>
@@ -29,6 +42,13 @@
 
 using namespace RC;
 using namespace RC::Unreal;
+
+// Forward declarations for helpers defined further down (used by lua_lootitems
+// and lua_giveitem before their definition).
+static std::unordered_set<uintptr_t> gather_live_uobjects();
+static std::wstring get_loot_source_name_safe(
+    UObject* loot_view,
+    const std::unordered_set<uintptr_t>& live);
 
 // ---------------------------------------------------------------------------
 // Small string helpers (wide <-> narrow, lossy ASCII-only — fine for names)
@@ -1200,22 +1220,46 @@ static int lua_giveloot(const LuaMadeSimple::Lua& lua)
     if (to_take > count) to_take = count;
 
     int teleported = 0;
+    FVector last_post{};
+    double last_dist2 = -1;
     for (int i = 0; i < to_take; ++i) {
         AActor* a = populated[i];
         UFunction* tp_fn = a->GetFunctionByNameInChain(STR("K2_TeleportTo"));
         if (!tp_fn) tp_fn = a->GetFunctionByNameInChain(STR("K2_SetActorLocation"));
         if (!tp_fn) continue;
+        // Offset loot around player's feet (Z-100 from capsule center),
+        // spread horizontally so multiple drops don't stack at the same point.
+        double angle = (double)i * 1.0471975512; // ~60° spacing
+        double dx = 80.0 * std::cos(angle);
+        double dy = 80.0 * std::sin(angle);
+        FVector drop(loc.X() + dx, loc.Y() + dy, loc.Z() - 80.0);
         std::vector<uint8_t> params(0x80, 0);
-        std::memcpy(params.data() + 0x00, &loc, sizeof(FVector));
+        std::memcpy(params.data() + 0x00, &drop, sizeof(FVector));
         a->ProcessEvent(tp_fn, params.data());
         teleported++;
+
+        // Diagnostic: read actor's location post-teleport
+        UFunction* loc_fn2 = a->GetFunctionByNameInChain(STR("K2_GetActorLocation"));
+        if (loc_fn2) {
+            struct { FVector ReturnValue; } p2{};
+            a->ProcessEvent(loc_fn2, &p2);
+            last_post = p2.ReturnValue;
+            double dx = last_post.X() - loc.X();
+            double dy = last_post.Y() - loc.Y();
+            double dz = last_post.Z() - loc.Z();
+            last_dist2 = dx*dx + dy*dy + dz*dz;
+        }
     }
 
-    char buf[256];
+    char buf[512];
     std::snprintf(buf, sizeof(buf),
                   "world has %d loot actor(s): %d populated, %d empty. "
-                  "Teleported %d to you. Auto-pickup should deliver items shortly.",
-                  total_seen, (int)populated.size(), empty_count, teleported);
+                  "Teleported %d to you. Player at (%.1f,%.1f,%.1f). "
+                  "Last actor post-tp at (%.1f,%.1f,%.1f), dist2=%.1f.",
+                  total_seen, (int)populated.size(), empty_count, teleported,
+                  loc.X(), loc.Y(), loc.Z(),
+                  last_post.X(), last_post.Y(), last_post.Z(),
+                  last_dist2);
     lua.set_string(std::string(buf));
     return 1;
 }
@@ -1327,6 +1371,909 @@ static int lua_lootlist(const LuaMadeSimple::Lua& lua)
     });
     out += "  [populated shown: " + std::to_string(shown) +
            ", empty skipped: " + std::to_string(empty) + "]\n";
+    lua.set_string(out);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Specific-item give (v0.5) — identify items referenced by a populated
+// R5LootActor so admins can target a specific item (e.g. "banana") rather
+// than taking whatever random loot happens to be on the nearest populated
+// actor.
+//
+// Approach: UR5BLInventoryItem data assets are all pre-loaded in the UObject
+// table (300+ assets under /R5BusinessRules/InventoryItems/ plus /Tests/).
+// The slot data inside a DropView is non-reflected, but it *does* reference
+// the item data asset somewhere — either as a cached UObject* or via a
+// TSoftObjectPtr whose FWeakObjectPtr.ObjectIndex matches the data asset's
+// UObject::GetInternalIndex(). We scan the LootView's first ~4KB of memory
+// for either:
+//   (a) an 8-byte-aligned pointer value matching a known data-asset address
+//   (b) a 4-byte-aligned int32 matching a known data-asset InternalIndex
+//
+// Caveats: identifies by the FIRST item referenced; a loot actor holding
+// a mixed stack (rare) would only surface one. FName-table hash matches
+// are possible but noisier — we avoid them to keep false positives low.
+// ---------------------------------------------------------------------------
+
+struct InvItemEntry
+{
+    UObject*      obj;          // data asset address (stable for process lifetime)
+    int32         index;        // UObject::GetInternalIndex()
+    std::wstring  short_name;   // lowercased — for user-search substring
+    std::wstring  display_name; // original — for reporting
+};
+
+static std::vector<InvItemEntry> gather_all_items()
+{
+    std::vector<InvItemEntry> out;
+    out.reserve(512);
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur) return LoopAction::Continue;
+        auto* cls = cur->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5BLInventoryItem")) return LoopAction::Continue;
+        auto full = cur->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+        InvItemEntry e;
+        e.obj = cur;
+        e.index = cur->GetInternalIndex();
+        std::wstring nm(cur->GetName());
+        e.display_name = nm;
+        e.short_name = wlower(nm);
+        out.push_back(std::move(e));
+        return LoopAction::Continue;
+    });
+    return out;
+}
+
+// Heuristic: pointer looks like a code pointer (vtable). Windows x64 Shipping
+// game code typically loads in the [0x00007FF0_00000000 .. 0x00007FFF_FFFFFFFF]
+// range. Heap pointers we've observed sit much lower (0x0000019D..., etc).
+static bool is_code_like_ptr(uintptr_t v)
+{
+    return v >= 0x00007FF000000000ull && v <= 0x00007FFFFFFFFFFFull;
+}
+
+// Check whether `len` bytes starting at `p` are safely readable in the current
+// process. Uses VirtualQuery to avoid SEGV on arbitrary user pointers we pull
+// from a memory scan.
+static bool is_readable(const void* p, size_t len)
+{
+    if (!p || len == 0) return false;
+    const uint8_t* cur = reinterpret_cast<const uint8_t*>(p);
+    const uint8_t* end = cur + len;
+    while (cur < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(cur, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        DWORD prot = mbi.Protect;
+        if (prot & PAGE_GUARD) return false;
+        if (prot & PAGE_NOACCESS) return false;
+        const bool readable = (prot & (PAGE_READONLY | PAGE_READWRITE |
+                                        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                        PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) != 0;
+        if (!readable) return false;
+        const uint8_t* region_end = reinterpret_cast<const uint8_t*>(mbi.BaseAddress)
+                                  + mbi.RegionSize;
+        cur = (region_end > cur) ? region_end : (cur + 4096);
+    }
+    return true;
+}
+
+// Core scanner. Matches UR5BLInventoryItem refs by:
+//   (a) 8-byte-aligned pointer value
+//   (b) 8-byte-aligned FWeakObjectPtr {int32 InternalIndex, int32 SerialNumber}
+//       where the serial is a plausible nonzero small int (cuts false positives
+//       from e.g. stack counts that randomly equal a low item's InternalIndex).
+// Results appended (deduped) to out_hits.
+static void scan_region(
+    const uint8_t*                                          bytes,
+    size_t                                                  region_bytes,
+    const std::unordered_map<uintptr_t, const InvItemEntry*>& by_ptr,
+    const std::unordered_map<int32,     const InvItemEntry*>& by_idx,
+    std::vector<const InvItemEntry*>&                       out_hits,
+    size_t                                                  max_hits)
+{
+    auto already_have = [&](const InvItemEntry* e) {
+        for (auto* h : out_hits) if (h == e) return true;
+        return false;
+    };
+
+    // Pointer scan (8-byte aligned).
+    for (size_t i = 0; i + 8 <= region_bytes; i += 8) {
+        uintptr_t v = *reinterpret_cast<const uintptr_t*>(bytes + i);
+        if (v < 0x10000) continue;
+        auto it = by_ptr.find(v);
+        if (it != by_ptr.end() && !already_have(it->second)) {
+            out_hits.push_back(it->second);
+            if (out_hits.size() >= max_hits) return;
+        }
+    }
+
+    // FWeakObjectPtr pair scan: aligned {InternalIndex, SerialNumber}.
+    // Require serial > 0 and < 0x10000000 to rule out coincidental ints.
+    for (size_t i = 0; i + 8 <= region_bytes; i += 8) {
+        int32 idx    = *reinterpret_cast<const int32*>(bytes + i);
+        int32 serial = *reinterpret_cast<const int32*>(bytes + i + 4);
+        if (idx <= 0 || idx > 0x00FFFFFF) continue;
+        if (serial <= 0 || serial > 0x10000000) continue;
+        auto it = by_idx.find(idx);
+        if (it != by_idx.end() && !already_have(it->second)) {
+            out_hits.push_back(it->second);
+            if (out_hits.size() >= max_hits) return;
+        }
+    }
+}
+
+// Scan an object's memory for references to known UR5BLInventoryItem data
+// assets, following 1 level of plausible heap pointers. The DropView's slot
+// pointers live at ~+0x180 and target 0x60-byte slot structures elsewhere on
+// the heap (~MB offsets); the pointer-chase pass follows each plausible
+// pointer we find into its target region and scans 0x100 bytes there too.
+static void scan_for_item_refs(
+    const void*                               region_start,
+    size_t                                    region_bytes,
+    const std::vector<InvItemEntry>&          items,
+    std::vector<const InvItemEntry*>&         out_hits,
+    size_t                                    max_hits = 8)
+{
+    if (!region_start || region_bytes == 0 || items.empty()) return;
+
+    std::unordered_map<uintptr_t, const InvItemEntry*> by_ptr;
+    std::unordered_map<int32,     const InvItemEntry*> by_idx;
+    by_ptr.reserve(items.size() * 2);
+    by_idx.reserve(items.size() * 2);
+    for (const auto& e : items) {
+        by_ptr[reinterpret_cast<uintptr_t>(e.obj)] = &e;
+        by_idx[e.index] = &e;
+    }
+
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(region_start);
+
+    // Pass 1: scan the region itself.
+    scan_region(bytes, region_bytes, by_ptr, by_idx, out_hits, max_hits);
+    if (out_hits.size() >= max_hits) return;
+
+    // Pass 2+3: chase pointers into valid heap regions and scan a 0x200-byte
+    // window at each, two levels deep. Only follow pointers in the same heap
+    // arena as the region we're scanning (top 24 bits match). Bounded total
+    // work so we don't hang on a bad scan target.
+    uintptr_t region_arena = reinterpret_cast<uintptr_t>(region_start) >> 40;
+    std::unordered_set<uintptr_t> already_chased;
+    int chased = 0;
+
+    auto chase_one_level = [&](const uint8_t* src_bytes, size_t src_len) {
+        for (size_t i = 0; i + 8 <= src_len && chased < 128; i += 8) {
+            uintptr_t v = *reinterpret_cast<const uintptr_t*>(src_bytes + i);
+            if ((v >> 40) != region_arena) continue;
+            if ((v & 7) != 0) continue;
+            if (!already_chased.insert(v).second) continue;
+            const void* p = reinterpret_cast<const void*>(v);
+            if (!is_readable(p, 0x200)) continue;
+            scan_region(reinterpret_cast<const uint8_t*>(p), 0x200,
+                        by_ptr, by_idx, out_hits, max_hits);
+            ++chased;
+            if (out_hits.size() >= max_hits) return;
+        }
+    };
+
+    // Level 1: from the original region.
+    chase_one_level(bytes, region_bytes);
+    if (out_hits.size() >= max_hits) return;
+
+    // Level 2: from every region we reached in level 1.
+    std::vector<uintptr_t> level1(already_chased.begin(), already_chased.end());
+    for (uintptr_t p : level1) {
+        if (chased >= 128) break;
+        if (out_hits.size() >= max_hits) return;
+        const void* pp = reinterpret_cast<const void*>(p);
+        if (!is_readable(pp, 0x200)) continue;
+        chase_one_level(reinterpret_cast<const uint8_t*>(pp), 0x200);
+    }
+}
+
+// Given a populated R5LootActor, resolve the short source-actor name — the BP
+// class the loot came from (e.g. "BP_Segment_Coast_Jungle_Ficus_1800cm_C").
+// LootView+0x180 is an array of pointers to StaticMeshComponents of the
+// source actor; that component's Outer is the source actor itself.
+// Returns empty string if we can't resolve.
+// Generic container classes — skip when picking a "source" identifier.
+static bool is_generic_container_class(std::wstring_view name)
+{
+    static const std::wstring_view kGeneric[] = {
+        // UE core types (meta-classes, containers).
+        STR("World"), STR("Level"), STR("Package"),
+        STR("LevelStreamingDynamic"),
+        STR("Class"), STR("Function"), STR("Struct"),
+        STR("BlueprintGeneratedClass"), STR("ScriptStruct"), STR("Enum"),
+        STR("GameEngine"), STR("GameInstance"),
+        STR("Object"), STR("UserDefinedEnum"), STR("UserDefinedStruct"),
+        // R5 / Windrose subsystems.
+        STR("R5BLIslandView"),
+        STR("R5GameplayOrchestrator"),
+        STR("R5GOS_GameplaySpawners"),
+        STR("R5DataCacheUe"),
+        STR("R5DataKeeperForServerCoop"),
+        STR("R5DataKeeperForServer_Account"),
+        STR("R5GameInstance"),
+        STR("R5GameMode"),
+        STR("R5BusinessActionManager"),
+        STR("R5ActionManager"),
+        STR("R5Environment"),
+    };
+    for (auto g : kGeneric) if (name == g) return true;
+    // Prefix skips.
+    if (name.size() > 6 && name.substr(0, 6) == STR("R5GOS_")) return true;
+    if (name.size() > 7 && name.substr(0, 7) == STR("Default")) return true;
+    return false;
+}
+
+// Safely read one object's class name. Single hop only. Returns empty on any
+// failed validation — no deep walking (each hop compounds crash risk).
+static std::wstring safe_class_name(UObject* obj, uintptr_t arena)
+{
+    if (!obj || !is_readable(obj, 0x30)) return L"";
+    uintptr_t vt = *reinterpret_cast<const uintptr_t*>(obj);
+    if (!is_code_like_ptr(vt)) return L"";
+    uintptr_t cls_raw = *reinterpret_cast<const uintptr_t*>(
+        reinterpret_cast<const uint8_t*>(obj) + 0x10);
+    bool cls_loc = ((cls_raw >> 40) == arena) || is_code_like_ptr(cls_raw);
+    if (!cls_loc) return L"";
+    if (!is_readable(reinterpret_cast<const void*>(cls_raw), 0x30)) return L"";
+    if (!is_code_like_ptr(*reinterpret_cast<const uintptr_t*>(cls_raw))) return L"";
+    auto* cls = obj->GetClassPrivate();
+    if (!cls) return L"";
+    return std::wstring(cls->GetName());
+}
+
+static std::wstring get_loot_source_name(UObject* loot_view)
+{
+    if (!loot_view || !is_readable(loot_view, 0x200)) return L"";
+    uintptr_t lv_arena = reinterpret_cast<uintptr_t>(loot_view) >> 40;
+    const uint8_t* lv_bytes = reinterpret_cast<const uint8_t*>(loot_view);
+
+    // Pass 1: scan +0x28..+0x2C0 for a candidate pointer. For each, try the
+    // candidate's Outer (safe single hop); if the Outer class is specific,
+    // use it. Skip generic containers.
+    for (size_t off = 0x28; off + 8 <= 0x2C0; off += 8) {
+        uintptr_t v = *reinterpret_cast<const uintptr_t*>(lv_bytes + off);
+        if ((v >> 40) != lv_arena) continue;
+        if ((v & 7) != 0) continue;
+        const void* p = reinterpret_cast<const void*>(v);
+        if (!is_readable(p, 0x30)) continue;
+        uintptr_t v_vtable = *reinterpret_cast<const uintptr_t*>(p);
+        if (!is_code_like_ptr(v_vtable)) continue;
+
+        UObject* obj = reinterpret_cast<UObject*>(const_cast<void*>(p));
+        uintptr_t outer_raw = *reinterpret_cast<const uintptr_t*>(
+            reinterpret_cast<const uint8_t*>(p) + 0x20);
+        if (outer_raw == 0) continue;
+        UObject* outer = reinterpret_cast<UObject*>(outer_raw);
+        std::wstring cn = safe_class_name(outer, lv_arena);
+        if (cn.empty() || is_generic_container_class(cn)) continue;
+        return cn;
+    }
+
+    // Pass 2: DropView's own Outer.
+    uintptr_t dv_outer = *reinterpret_cast<const uintptr_t*>(lv_bytes + 0x20);
+    if (dv_outer != 0) {
+        UObject* ofrom = reinterpret_cast<UObject*>(dv_outer);
+        std::wstring cn = safe_class_name(ofrom, lv_arena);
+        if (!cn.empty() && !is_generic_container_class(cn)) return cn;
+    }
+
+    return L"";
+}
+
+// Spatial fallback — find nearest source-like actor to the loot actor's
+// world position. Used for mob/chest drops where Outer resolution gives a
+// generic container. Only reads reflected UFunctions (K2_GetActorLocation),
+// so it's crash-safe.
+struct SourceCandidate { AActor* actor; FVector loc; std::wstring cname; };
+
+static std::vector<SourceCandidate> gather_source_candidates()
+{
+    std::vector<SourceCandidate> out;
+    out.reserve(4096);
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur) return LoopAction::Continue;
+        auto* cls = cur->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        auto cname = cls->GetName();
+        std::wstring_view cn_view(cname);
+        bool source_like =
+            cn_view.find(STR("BP_Segment_"))  != std::wstring_view::npos ||
+            cn_view.find(STR("BP_Mob_"))      != std::wstring_view::npos ||
+            cn_view.find(STR("BP_Dead"))      != std::wstring_view::npos ||
+            cn_view.find(STR("AICharacter"))  != std::wstring_view::npos ||
+            cn_view.find(STR("Chest"))        != std::wstring_view::npos ||
+            cn_view.find(STR("Pickup"))       != std::wstring_view::npos ||
+            cn_view.find(STR("R5BLActor_"))   != std::wstring_view::npos;
+        if (!source_like) return LoopAction::Continue;
+        auto full = cur->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+
+        AActor* actor = reinterpret_cast<AActor*>(cur);
+        UFunction* loc_fn = actor->GetFunctionByNameInChain(STR("K2_GetActorLocation"));
+        if (!loc_fn) return LoopAction::Continue;
+        struct { FVector ReturnValue; } p{};
+        actor->ProcessEvent(loc_fn, &p);
+
+        out.push_back({ actor, p.ReturnValue, std::wstring(cname) });
+        return LoopAction::Continue;
+    });
+    return out;
+}
+
+static std::wstring find_nearest_source(AActor* loot_actor,
+                                        const std::vector<SourceCandidate>& cands,
+                                        double radius)
+{
+    UFunction* loc_fn = loot_actor->GetFunctionByNameInChain(STR("K2_GetActorLocation"));
+    if (!loc_fn) return L"";
+    struct { FVector ReturnValue; } p{};
+    loot_actor->ProcessEvent(loc_fn, &p);
+    FVector ll = p.ReturnValue;
+
+    double best = radius * radius;
+    std::wstring best_name;
+    for (const auto& c : cands) {
+        double dx = c.loc.X() - ll.X();
+        double dy = c.loc.Y() - ll.Y();
+        double dz = c.loc.Z() - ll.Z();
+        double d2 = dx*dx + dy*dy + dz*dz;
+        if (d2 < best) { best = d2; best_name = c.cname; }
+    }
+    return best_name;
+}
+
+// ap_native_lootitems([N]) -> list the first N populated R5LootActors and
+// the source BP class for each ("Ficus_1800cm_C", "BP_Mob_Chicken_C", etc).
+// The actual item identity lives in a central subsystem table we can't reach
+// from DropView memory; the source name is the next best identifier.
+static int lua_lootitems(const LuaMadeSimple::Lua& lua)
+{
+    int N = 20;
+    if (lua.is_number()) {
+        N = static_cast<int>(lua.get_float());
+        if (N < 1)   N = 1;
+        if (N > 100) N = 100;
+    }
+
+    // Build spatial candidate index once (covers mob / chest drops that
+    // the Outer-walk can't identify).
+    auto live = gather_live_uobjects();
+    std::string out = "Populated R5LootActors (source-actor class names):\n";
+    int shown = 0, empty = 0;
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur || shown >= N) return shown >= N ? LoopAction::Break : LoopAction::Continue;
+        auto* cls = cur->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5LootActor")) return LoopAction::Continue;
+        auto full = cur->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+        UObject* lv = *reinterpret_cast<UObject**>(
+            reinterpret_cast<uint8_t*>(cur) + 0x310);
+        if (!lv) { empty++; return LoopAction::Continue; }
+
+        std::wstring src = get_loot_source_name_safe(lv, live);
+        std::string src_narrow = src.empty() ? "<unknown source>" : w_to_narrow(src);
+
+        char buf[320];
+        std::snprintf(buf, sizeof(buf), "  [%d] actor=0x%p  source=%s\n",
+                      shown, (void*)cur, src_narrow.c_str());
+        out += buf;
+        shown++;
+        return LoopAction::Continue;
+    });
+    out += "  [populated shown: " + std::to_string(shown) +
+           ", empty skipped: " + std::to_string(empty) + "]\n";
+    lua.set_string(out);
+    return 1;
+}
+
+// ap_native_giveitem(player, search) -> find a populated R5LootActor whose
+// SOURCE actor class (the BP that produced the drop) matches `search`
+// (case-insensitive substring) and teleport it to the player.
+//
+// The DropView's actual item data is held in a central subsystem table we
+// can't reach from LootView memory, so identifying the item directly isn't
+// viable. Matching on source BP name is the next-best identifier: it tells
+// you what tree/mob/resource-node produced the drop (e.g. "ficus" matches
+// any Ficus-tree drop, "chicken" matches chicken drops).
+static int lua_giveitem(const LuaMadeSimple::Lua& lua)
+{
+    if (!lua.is_string()) { lua.set_string("usage: ap_native_giveitem(player, search)"); return 1; }
+    auto target_name = to_wlower(lua.get_string());
+    if (!lua.is_string()) { lua.set_string("search required"); return 1; }
+    auto search_lower = to_wlower(lua.get_string());
+
+    auto player = find_player_by_name(target_name);
+    if (!player.pawn) { lua.set_string("player not found"); return 1; }
+
+    FVector loc{};
+    {
+        UFunction* fn = player.pawn->GetFunctionByNameInChain(STR("K2_GetActorLocation"));
+        if (!fn) { lua.set_string("K2_GetActorLocation missing"); return 1; }
+        struct { FVector ReturnValue; } p{};
+        player.pawn->ProcessEvent(fn, &p);
+        loc = p.ReturnValue;
+    }
+
+    auto live = gather_live_uobjects();
+    AActor*      chosen_actor = nullptr;
+    std::wstring chosen_src;
+    AActor*      fallback_actor = nullptr;  // first populated; used if search misses
+    int          scanned_actors   = 0;
+    int          populated_actors = 0;
+
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur || chosen_actor) return chosen_actor ? LoopAction::Break : LoopAction::Continue;
+        auto* cls = cur->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5LootActor")) return LoopAction::Continue;
+        auto full = cur->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+        scanned_actors++;
+        UObject* lv = *reinterpret_cast<UObject**>(
+            reinterpret_cast<uint8_t*>(cur) + 0x310);
+        if (!lv) return LoopAction::Continue;
+        populated_actors++;
+        if (!fallback_actor) fallback_actor = reinterpret_cast<AActor*>(cur);
+
+        std::wstring src = get_loot_source_name_safe(lv, live);
+        if (src.empty()) return LoopAction::Continue;
+        std::wstring src_lower = wlower(src);
+        if (src_lower.find(search_lower) == std::wstring::npos) return LoopAction::Continue;
+
+        chosen_actor = reinterpret_cast<AActor*>(cur);
+        chosen_src   = src;
+        return LoopAction::Break;
+    });
+
+    bool used_fallback = false;
+    if (!chosen_actor) {
+        if (!fallback_actor) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                          "No populated loot actors in the world "
+                          "(loot actors scanned: %d). Break trees / kill mobs first.",
+                          scanned_actors);
+            lua.set_string(std::string(buf));
+            return 1;
+        }
+        chosen_actor  = fallback_actor;
+        used_fallback = true;
+    }
+
+    UFunction* tp_fn = chosen_actor->GetFunctionByNameInChain(STR("K2_TeleportTo"));
+    if (!tp_fn) tp_fn = chosen_actor->GetFunctionByNameInChain(STR("K2_SetActorLocation"));
+    if (!tp_fn) { lua.set_string("no teleport function on loot actor"); return 1; }
+    // Drop at player feet, offset ahead so it's not inside the pawn capsule.
+    FVector drop(loc.X() + 80.0, loc.Y(), loc.Z() - 80.0);
+    std::vector<uint8_t> params(0x80, 0);
+    std::memcpy(params.data() + 0x00, &drop, sizeof(FVector));
+    chosen_actor->ProcessEvent(tp_fn, params.data());
+
+    char buf[512];
+    if (used_fallback) {
+        std::snprintf(buf, sizeof(buf),
+                      "No loot actor matched '%s' specifically. Teleported a "
+                      "random populated loot actor to %s instead. "
+                      "Run 'ap.lootitems' to see what specific sources are "
+                      "identifiable in the current world state.",
+                      w_to_narrow(search_lower).c_str(),
+                      w_to_narrow(player.name).c_str());
+    } else {
+        std::snprintf(buf, sizeof(buf),
+                      "Teleported loot actor (source: %s) to %s. "
+                      "Auto-pickup should deliver its contents shortly.",
+                      w_to_narrow(chosen_src).c_str(),
+                      w_to_narrow(player.name).c_str());
+    }
+    lua.set_string(std::string(buf));
+    return 1;
+}
+
+// ap_native_itemlist([search]) -> list known UR5BLInventoryItem data assets,
+// optionally filtered by a case-insensitive substring on the short name.
+static int lua_itemlist(const LuaMadeSimple::Lua& lua)
+{
+    std::wstring search;
+    if (lua.is_string()) search = to_wlower(lua.get_string());
+
+    auto items = gather_all_items();
+    std::string out;
+
+    int shown = 0;
+    for (const auto& e : items) {
+        if (!search.empty() && e.short_name.find(search) == std::wstring::npos) continue;
+        if (shown == 0) {
+            out = "UR5BLInventoryItem data assets";
+            if (!search.empty()) out += " matching '" + w_to_narrow(search) + "'";
+            out += ":\n";
+        }
+        out += "  " + w_to_narrow(e.display_name) + "\n";
+        shown++;
+        if (shown >= 200) {
+            out += "  [capped at 200]\n";
+            break;
+        }
+    }
+    if (shown == 0) {
+        out = "No items";
+        if (!search.empty()) out += " matching '" + w_to_narrow(search) + "'";
+        out += ". Known item count: " + std::to_string(items.size());
+    } else {
+        out += "  [total shown: " + std::to_string(shown) +
+               " / known: " + std::to_string(items.size()) + "]\n";
+    }
+    lua.set_string(out);
+    return 1;
+}
+
+// ap_native_itemscan(target, [bytes]) -> scan an object's raw memory for any
+// references to known UR5BLInventoryItem data assets. Debug tool to verify
+// the ref-scan technique on live inventory views (chests, etc.) without
+// needing a populated loot actor in the world.
+static int lua_itemscan(const LuaMadeSimple::Lua& lua)
+{
+    if (!lua.is_string()) { lua.set_string("usage: ap_native_itemscan(target, [bytes])"); return 1; }
+    auto target_narrow = std::string(lua.get_string());
+    std::wstring target_wide;
+    for (char c : target_narrow) target_wide.push_back(static_cast<wchar_t>(c));
+
+    int bytes = 4096;
+    if (lua.is_number()) {
+        bytes = static_cast<int>(lua.get_float());
+        if (bytes < 64)    bytes = 64;
+        if (bytes > 65536) bytes = 65536;
+    }
+
+    UObject* obj = nullptr;
+    if (!target_narrow.empty() && target_narrow[0] == '/') {
+        obj = UObjectGlobals::FindObject(nullptr, nullptr, target_wide.c_str());
+    } else {
+        UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+            if (!cur || obj) return obj ? LoopAction::Break : LoopAction::Continue;
+            auto* cls = cur->GetClassPrivate();
+            if (!cls) return LoopAction::Continue;
+            if (std::wstring_view(cls->GetName()) != target_wide) return LoopAction::Continue;
+            auto full = cur->GetFullName();
+            if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+            obj = cur;
+            return LoopAction::Break;
+        });
+    }
+    if (!obj) { lua.set_string("object not found: " + target_narrow); return 1; }
+
+    auto items = gather_all_items();
+    std::vector<const InvItemEntry*> hits;
+    scan_for_item_refs(obj, static_cast<size_t>(bytes), items, hits, 32);
+
+    std::string out = "target: " + w_to_narrow(obj->GetFullName()).substr(0, 180) + "\n";
+    {
+        char b[64]; std::snprintf(b, sizeof(b), "addr: 0x%p\n", (void*)obj);
+        out += b;
+    }
+    out += "scanned " + std::to_string(bytes) + " bytes against " +
+           std::to_string(items.size()) + " known items\n";
+    out += "matches: " + std::to_string(hits.size()) + "\n";
+    for (size_t i = 0; i < hits.size(); ++i) {
+        out += "  [" + std::to_string(i) + "] " + w_to_narrow(hits[i]->display_name) + "\n";
+    }
+    lua.set_string(out);
+    return 1;
+}
+
+// Build a set of live UObject addresses — checking candidate pointers
+// against this set before calling virtual methods makes source-walking
+// crash-safe (no SEH needed).
+static std::unordered_set<uintptr_t> gather_live_uobjects()
+{
+    std::unordered_set<uintptr_t> out;
+    out.reserve(131072);
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (cur) out.insert(reinterpret_cast<uintptr_t>(cur));
+        return LoopAction::Continue;
+    });
+    return out;
+}
+
+// Resolve source name by scanning DropView for pointers that are confirmed
+// live UObjects, then walking their Outer chain through the known-object set
+// to the first non-generic class. Crash-safe because every dereferenced
+// pointer is validated against the UObject table.
+static std::wstring get_loot_source_name_safe(UObject* loot_view,
+                                              const std::unordered_set<uintptr_t>& live)
+{
+    if (!loot_view) return L"";
+    uintptr_t lv_arena = reinterpret_cast<uintptr_t>(loot_view) >> 40;
+    const uint8_t* lv_bytes = reinterpret_cast<const uint8_t*>(loot_view);
+
+    auto walk = [&](UObject* obj) -> std::wstring {
+        for (int hop = 0; hop < 6 && obj; ++hop) {
+            if (live.find(reinterpret_cast<uintptr_t>(obj)) == live.end()) return L"";
+            auto* cls = obj->GetClassPrivate();
+            if (!cls) return L"";
+            std::wstring cn(cls->GetName());
+            if (!is_generic_container_class(cn)) return cn;
+            uintptr_t outer_raw = *reinterpret_cast<const uintptr_t*>(
+                reinterpret_cast<const uint8_t*>(obj) + 0x20);
+            if (outer_raw == 0) return L"";
+            obj = reinterpret_cast<UObject*>(outer_raw);
+        }
+        return L"";
+    };
+
+    for (size_t off = 0x28; off + 8 <= 0x2C0; off += 8) {
+        uintptr_t v = *reinterpret_cast<const uintptr_t*>(lv_bytes + off);
+        if ((v & 7) != 0) continue;
+        if (live.find(v) == live.end()) continue;
+        if (v == reinterpret_cast<uintptr_t>(loot_view)) continue;
+
+        UObject* obj = reinterpret_cast<UObject*>(v);
+        // Try walking from Outer first (gets away from generic components
+        // like StaticMeshComponent immediately).
+        uintptr_t outer_raw = *reinterpret_cast<const uintptr_t*>(
+            reinterpret_cast<const uint8_t*>(obj) + 0x20);
+        if (outer_raw != 0) {
+            UObject* outer = reinterpret_cast<UObject*>(outer_raw);
+            std::wstring cn = walk(outer);
+            if (!cn.empty()) return cn;
+        }
+        // Also try the pointed-to object itself (in case it's directly
+        // the source).
+        std::wstring cn2 = walk(obj);
+        if (!cn2.empty()) return cn2;
+    }
+
+    // Fallback: DropView's own Outer.
+    uintptr_t dv_outer = *reinterpret_cast<const uintptr_t*>(lv_bytes + 0x20);
+    if (dv_outer != 0) {
+        UObject* o = reinterpret_cast<UObject*>(dv_outer);
+        std::wstring cn = walk(o);
+        if (!cn.empty()) return cn;
+    }
+    return L"";
+}
+
+#if 0
+// Diagnostic retained for reference; disabled due to crashes on non-UObject
+// pointers that pass heuristic validation. The safer path is
+// get_loot_source_name_safe above, which only dereferences pointers that
+// exist in the live UObject table.
+static int lua_lootsource(const LuaMadeSimple::Lua& lua)
+{
+    AActor*  actor = nullptr;
+    UObject* loot_view = nullptr;
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur || actor) return actor ? LoopAction::Break : LoopAction::Continue;
+        auto* cls = cur->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5LootActor")) return LoopAction::Continue;
+        auto full = cur->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+        UObject* lv = *reinterpret_cast<UObject**>(
+            reinterpret_cast<uint8_t*>(cur) + 0x310);
+        if (!lv) return LoopAction::Continue;
+        actor = reinterpret_cast<AActor*>(cur);
+        loot_view = lv;
+        return LoopAction::Break;
+    });
+    if (!actor) { lua.set_string("no populated R5LootActor found"); return 1; }
+
+    std::string out;
+    {
+        char b[320];
+        std::snprintf(b, sizeof(b), "actor: %s\nloot_view: 0x%p\n\n",
+                      w_to_narrow(actor->GetFullName()).substr(0, 180).c_str(),
+                      (void*)loot_view);
+        out += b;
+    }
+
+    uintptr_t lv_arena = reinterpret_cast<uintptr_t>(loot_view) >> 40;
+    const uint8_t* lv_bytes = reinterpret_cast<const uint8_t*>(loot_view);
+    std::unordered_set<uintptr_t> seen;
+
+    for (size_t off = 0x28; off + 8 <= 0x2C0; off += 8) {
+        uintptr_t v = *reinterpret_cast<const uintptr_t*>(lv_bytes + off);
+        if ((v >> 40) != lv_arena) continue;
+        if ((v & 7) != 0) continue;
+        if (v == reinterpret_cast<uintptr_t>(loot_view)) continue;
+        if (!seen.insert(v).second) continue;
+        const void* p = reinterpret_cast<const void*>(v);
+        if (!is_readable(p, 0x30)) continue;
+        uintptr_t vt = *reinterpret_cast<const uintptr_t*>(p);
+        if (!is_code_like_ptr(vt)) continue;
+
+        UObject* obj = reinterpret_cast<UObject*>(const_cast<void*>(p));
+        std::wstring own_cn = safe_class_name(obj, lv_arena);
+        if (own_cn.empty()) continue;
+
+        std::wstring outer_cn;
+        std::wstring gp_cn;
+        uintptr_t outer_raw = *reinterpret_cast<const uintptr_t*>(
+            reinterpret_cast<const uint8_t*>(p) + 0x20);
+        if (outer_raw != 0) {
+            UObject* outer = reinterpret_cast<UObject*>(outer_raw);
+            outer_cn = safe_class_name(outer, lv_arena);
+            uintptr_t gp_raw = *reinterpret_cast<const uintptr_t*>(
+                reinterpret_cast<const uint8_t*>(outer) + 0x20);
+            if (gp_raw != 0) {
+                UObject* gp = reinterpret_cast<UObject*>(gp_raw);
+                gp_cn = safe_class_name(gp, lv_arena);
+            }
+        }
+
+        char b[512];
+        std::snprintf(b, sizeof(b),
+                      "  +0x%03zx = 0x%p\n"
+                      "    own:    %s\n"
+                      "    outer:  %s\n"
+                      "    grand:  %s\n",
+                      off, (void*)v,
+                      w_to_narrow(own_cn).c_str(),
+                      outer_cn.empty() ? "<?>" : w_to_narrow(outer_cn).c_str(),
+                      gp_cn.empty()    ? "<?>" : w_to_narrow(gp_cn).c_str());
+        out += b;
+    }
+
+    lua.set_string(out);
+    return 1;
+}
+#endif
+
+// ap_native_lootslots([N]) -> find the first populated R5LootActor and
+// hex-dump the first N slots' 0x60 bytes. Slots live on the heap at
+// addresses held in a pointer array at ~LootView+0x180. Ground-truth
+// inspection so we can see exactly where an item reference sits within
+// a slot when the pointer-chasing scan doesn't find matches.
+static int lua_lootslots(const LuaMadeSimple::Lua& lua)
+{
+    int N = 4;
+    if (lua.is_number()) {
+        N = static_cast<int>(lua.get_float());
+        if (N < 1)  N = 1;
+        if (N > 16) N = 16;
+    }
+
+    AActor*  actor = nullptr;
+    UObject* loot_view = nullptr;
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur || actor) return actor ? LoopAction::Break : LoopAction::Continue;
+        auto* cls = cur->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5LootActor")) return LoopAction::Continue;
+        auto full = cur->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+        UObject* lv = *reinterpret_cast<UObject**>(
+            reinterpret_cast<uint8_t*>(cur) + 0x310);
+        if (!lv) return LoopAction::Continue;
+        actor = reinterpret_cast<AActor*>(cur);
+        loot_view = lv;
+        return LoopAction::Break;
+    });
+    if (!actor) { lua.set_string("no populated R5LootActor found"); return 1; }
+
+    // Scan LootView[+0x100..+0x2C0] for slot pointers. Real slot pointers
+    // share the top 24 bits with the LootView itself (same heap arena) and
+    // cluster within a few MB of each other.
+    std::vector<uintptr_t> slots;
+    const uint8_t* lv_bytes = reinterpret_cast<const uint8_t*>(loot_view);
+    uintptr_t lv_arena_tag = reinterpret_cast<uintptr_t>(loot_view) >> 40;
+    for (size_t off = 0x100; off + 8 <= 0x2C0; off += 8) {
+        uintptr_t v = *reinterpret_cast<const uintptr_t*>(lv_bytes + off);
+        if ((v >> 40) != lv_arena_tag) continue;
+        if ((v & 7) != 0) continue;
+        slots.push_back(v);
+        if ((int)slots.size() >= N) break;
+    }
+
+    auto items = gather_all_items();
+    std::unordered_map<uintptr_t, const InvItemEntry*> by_ptr;
+    std::unordered_map<int32,     const InvItemEntry*> by_idx;
+    for (const auto& e : items) {
+        by_ptr[reinterpret_cast<uintptr_t>(e.obj)] = &e;
+        by_idx[e.index] = &e;
+    }
+
+    std::string out;
+    {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "actor: %s\nloot_view: 0x%p (class %s)\n",
+                      w_to_narrow(actor->GetFullName()).substr(0, 180).c_str(),
+                      (void*)loot_view,
+                      loot_view->GetClassPrivate()
+                        ? w_to_narrow(loot_view->GetClassPrivate()->GetName()).c_str()
+                        : "?");
+        out += buf;
+    }
+    out += "candidate slot pointers: " + std::to_string(slots.size()) + "\n\n";
+
+    for (size_t i = 0; i < slots.size(); ++i) {
+        uintptr_t addr = slots[i];
+        const void* p = reinterpret_cast<const void*>(addr);
+        {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "=== slot[%zu] @ 0x%p ===\n", i, p);
+            out += buf;
+        }
+
+        if (!is_readable(p, 0x60)) { out += "  <unreadable>\n\n"; continue; }
+
+        const uint8_t* sb = reinterpret_cast<const uint8_t*>(p);
+
+        // Only probe the class name if vtable and ClassPrivate are both
+        // strongly UObject-shaped (code vtable, same-arena class pointer
+        // whose own vtable is also in code range).
+        uintptr_t v_vtable = *reinterpret_cast<const uintptr_t*>(sb);
+        uintptr_t cls_raw  = *reinterpret_cast<const uintptr_t*>(sb + 0x10);
+        bool      probed   = false;
+        bool cls_valid_loc = ((cls_raw >> 40) == (addr >> 40)) || is_code_like_ptr(cls_raw);
+        if (is_code_like_ptr(v_vtable) &&
+            cls_valid_loc &&
+            is_readable(reinterpret_cast<const void*>(cls_raw), 0x30))
+        {
+            uintptr_t cls_vtable = *reinterpret_cast<const uintptr_t*>(cls_raw);
+            if (is_code_like_ptr(cls_vtable)) {
+                UObject* as_obj = reinterpret_cast<UObject*>(const_cast<void*>(p));
+                auto* maybe_cls = as_obj->GetClassPrivate();
+                if (maybe_cls) {
+                    std::string cn = w_to_narrow(maybe_cls->GetName());
+                    char b[128];
+                    std::snprintf(b, sizeof(b), "  class: %s\n", cn.c_str());
+                    out += b;
+                    probed = true;
+                }
+            }
+        }
+        if (!probed) out += "  class: <not a UObject>\n";
+        for (int row = 0; row < 0x60; row += 16) {
+            char line[256];
+            int pos = std::snprintf(line, sizeof(line), "  %04x: ", row);
+            for (int j = 0; j < 16; j++)
+                pos += std::snprintf(line + pos, sizeof(line) - pos, "%02x ", sb[row + j]);
+            pos += std::snprintf(line + pos, sizeof(line) - pos, " |");
+            for (int j = 0; j < 16; j++) {
+                char c = static_cast<char>(sb[row + j]);
+                char oc = (c >= 32 && c < 127) ? c : '.';
+                pos += std::snprintf(line + pos, sizeof(line) - pos, "%c", oc);
+            }
+            pos += std::snprintf(line + pos, sizeof(line) - pos, "|\n");
+            out += line;
+        }
+
+        // Callout any word/dword that matches a known inventory item.
+        for (int off = 0; off + 8 <= 0x60; off += 8) {
+            uintptr_t v = *reinterpret_cast<const uintptr_t*>(sb + off);
+            if (v >= 0x10000) {
+                auto hit = by_ptr.find(v);
+                if (hit != by_ptr.end()) {
+                    char b[256];
+                    std::snprintf(b, sizeof(b), "  >> +0x%02x (ptr) -> ITEM '%s'\n",
+                                  off, w_to_narrow(hit->second->display_name).c_str());
+                    out += b;
+                }
+            }
+        }
+        for (int off = 0; off + 4 <= 0x60; off += 4) {
+            int32 v = *reinterpret_cast<const int32*>(sb + off);
+            if (v > 0 && v <= 0x00FFFFFF) {
+                auto hit = by_idx.find(v);
+                if (hit != by_idx.end()) {
+                    char b[256];
+                    std::snprintf(b, sizeof(b), "  >> +0x%02x (idx=%d) -> ITEM '%s'\n",
+                                  off, v, w_to_narrow(hit->second->display_name).c_str());
+                    out += b;
+                }
+            }
+        }
+        out += "\n";
+    }
+
     lua.set_string(out);
     return 1;
 }
@@ -1491,10 +2438,10 @@ public:
     AdmiralsPanelNative() : CppUserModBase()
     {
         ModName = STR("AdmiralsPanel-Native");
-        ModVersion = STR("0.2.0");
+        ModVersion = STR("0.5.0");
         ModDescription = STR("Native UFunction bridge for AdmiralsPanel");
         ModAuthors = STR("Mancavegaming");
-        Output::send<LogLevel::Verbose>(STR("[AdmiralsPanel-Native] loaded (v0.2.0)\n"));
+        Output::send<LogLevel::Verbose>(STR("[AdmiralsPanel-Native] loaded (v0.5.0)\n"));
     }
 
     ~AdmiralsPanelNative() override = default;
@@ -1527,6 +2474,11 @@ public:
         lua.register_function("admiralspanel_native_giveloot", lua_giveloot);
         lua.register_function("admiralspanel_native_lootlist", lua_lootlist);
         lua.register_function("admiralspanel_native_lootinspect", lua_lootinspect);
+        lua.register_function("admiralspanel_native_lootitems", lua_lootitems);
+        lua.register_function("admiralspanel_native_giveitem",  lua_giveitem);
+        lua.register_function("admiralspanel_native_itemlist",  lua_itemlist);
+        lua.register_function("admiralspanel_native_itemscan",  lua_itemscan);
+        lua.register_function("admiralspanel_native_lootslots", lua_lootslots);
         lua.register_function("admiralspanel_native_inspect", lua_inspect);
         lua.register_function("admiralspanel_native_kill",    lua_kill);
         Output::send<LogLevel::Verbose>(

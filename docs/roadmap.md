@@ -1,64 +1,30 @@
 # Roadmap
 
-## v0.1 (current)
+## Shipped
 
-Feature set committed and shipping. See [CHANGELOG.md](../CHANGELOG.md).
+- **v0.1 (2026-04-22)** — Lua-only: tunings, presets, admin log, web UI.
+- **v0.2 (2026-04-22)** — C++ companion mod (`AdmiralsPanelNative.dll`): GAS attribute writes. Heal / damage / kill / feed / revive / setattr / readattr / teleport.
+- **v0.3 (2026-04-23)** — Attributes tab, per-player row actions, live stat bars, multi-set attribute access (Posture, Comfort, RangeWeapon).
+- **v0.4 (2026-04-23)** — Random-loot give: `ap.giveloot` teleports populated loot actors, auto-pickup delivers whatever they hold. Plus a reverse-engineering toolkit (`ap.scan`, `ap.rawdumpn`, `ap.dumpclassn`, etc.).
+- **v0.5 (2026-04-24)** — Specific-item give: `ap.giveitem <player> <search>` identifies items in populated loot actors by scanning LootView memory for references to known `UR5BLInventoryItem` data assets. Supporting commands: `ap.lootitems`, `ap.itemlist`, `ap.itemscan`.
 
-## v0.2 — C++ companion mod *(the big one)*
+See [CHANGELOG.md](../CHANGELOG.md) for the full feature list per release.
 
-The biggest gap in v0.1 is that we can't heal, give items, teleport, or broadcast to in-game chat. Root cause: Windrose's Lua surface doesn't expose the UFunctions that would do these things natively.
+## Next up
 
-Solution: write a companion C++ UE4SS mod (call it `AdmiralsPanel-Native.dll`) that:
+- **Chat broadcast** (`ap.say` → real in-game message). `ClientMessage` is an RPC and UE4SS argument marshalling crashes; needs a non-RPC path from C++ ProcessEvent, or a server-side broadcast UFunction on GameMode that isn't an RPC.
+- **Specific-item give with arbitrary count / any item in the game** (not just what's currently in the world). Requires decoding the C++-only rule dispatcher (`R5BLInventory_AddItemsRule`). Multi-session RE, probably pattern-scanning the game binary.
+- **UI buttons for native commands**. `ap.giveitem`, `ap.giveloot`, `ap.healn`/`damagen`/`killn` per-row, `ap.attr*` presets — currently console-only. Pure web-panel work.
+- **Scheduled server actions** — cron-style restarts, timed announcements, multiplier swaps. Pure Lua; WindrosePlus tick hook + persisted state.
 
-- Hooks into the game via UE4SS native C++ API (not Lua).
-- Calls `TeleportTo`, `SetHealth`, `AddItemToInventory`, `BroadcastChatMessage`, etc. directly through the UE reflection system.
-- Exposes Lua-callable functions our main Lua mod can use (same pattern the WindrosePlus repo uses for `HeightmapExporter.dll`).
+## Later
 
-**Reference starting point**: `cpp-mods/HeightmapExporter/` in the WindrosePlus repo is a working, minimal C++ UE4SS mod that compiles with CMake + MSVC and exposes one function to Lua. Use it as a template.
-
-**What's needed**:
-
-1. UE5 SDK header dump for Windrose (generate with UE4SS's dumper).
-2. Identify the UFunctions: `TeleportTo`, a "set actor health" equivalent, `AddItemToInventory` (or similar) on the inventory component, and a broadcast chat function.
-3. CMakeLists + source file that loads, hooks, and exposes each as a Lua-callable function.
-4. Lua-side `ap.heal`, `ap.kill`, `ap.feed`, `ap.tp`, `ap.tpxyz`, `ap.give` commands that dispatch to the DLL.
-5. UI wiring in `web/app.js` — add heal/kill/give/teleport buttons to the Players tab.
-
-**Risk**: every game patch may shift function signatures or offsets. C++ mods need maintenance. We'd version-gate: the DLL would log `warn` and Lua commands would return "C++ extension missing or incompatible with this game build" if the hooks don't resolve.
-
-**Who can help**: anyone with UE4SS + C++ experience. This is the #1 wanted contribution.
-
-## v0.3 — quality of life
-
-Smaller features that are entirely within v0.1's Lua surface:
-
-- **Per-player speed persistence** — currently `wp.speed` doesn't persist across restarts. Our admin log could note and replay.
-- **Scheduled server restarts** — a Lua tick callback that announces T-10 / T-5 / T-1 minute, then calls a graceful-shutdown helper.
-- **Event timer**: apply a preset for N minutes, then auto-revert to `vanilla`. Uses tick callbacks + persisted state.
-- **Custom preset CRUD** from the UI (instead of editing `presets.json` by hand).
-- **UI polish**: sound on player join/leave, persistent theme picker, tooltips explaining "live" vs "restart-required" per multiplier.
-- **Live-vs-restart matrix discovery** — a command that probes each multiplier write and reports which actually changed gameplay (would require an AI-run test mob and loot roll). More exploration than implementation, but lets us populate the per-multiplier UI labels with ground truth.
-
-## v0.4 — integrations
-
-- **Discord bridge** — an external process (Node or Python) that polls `/api/rcon/log` + `events.log`, forwards player join/leave and `ap.say` messages to a Discord webhook. Accepts slash commands back via an HTTP server. Runs outside the game server, same-machine or elsewhere.
-- **Browser notifications** — the web panel pushes a notification when a player joins (requires the user to grant permission).
-- **Export audit log as CSV** — from the Server tab.
-
-## v0.5 — permissions
-
-Right now, anyone with the RCON password has full admin. For servers with multiple caretakers:
-
-- Per-admin Steam IDs with capability tiers (view-only / tuner / full admin).
-- UI that prompts for a Steam ID on first visit (read from a cookie / localStorage) and scopes UI controls to their tier.
-- Relies on the `admin.steam_ids` array that's already in `windrose_plus.json` — extend with role metadata.
-
-## Indefinite / upstream-dependent
-
-- **Inventory UI** (drag-and-drop give-item): depends on v0.2.
-- **Mob spawn control** (spawn/despawn creatures, set density): depends on v0.2.
-- **Terrain editing / world state tools** (weather, time of day writes that actually take effect): partially depends on v0.2, partially on whether Windrose replicates these values live.
-- **World backup / restore** from the UI: feasible in pure Lua (file I/O works), just significant to implement carefully.
+- **Discord bridge** — external process polls `/api/rcon/log` + `events.log`, forwards player join/leave and `ap.say` messages to a webhook; accepts slash commands back via HTTP.
+- **Browser notifications** on player join (web-panel side).
+- **Export audit log as CSV** from the Server tab.
+- **Permissions / Steam-ID tiers** — per-admin capability scoping. `windrose_plus.json`'s `admin.steam_ids` array is the starting point.
+- **Mob admin** — extend the native attribute surface to AI characters (same pattern, different attribute set).
+- **World backup / restore** from the UI.
 
 ## Non-goals
 
