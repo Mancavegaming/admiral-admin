@@ -4,19 +4,14 @@
 > standalone**; no WindrosePlus dependency required. Legacy sub-mod install
 > still supported for existing users.
 
-AdmiralsPanel gives you a web UI with buttons, sliders, and presets so you never have to type `wp.speed mancave 1.5` again. Live player list, per-player speed, server multipliers, difficulty presets, announcements, heal/feed/kill buttons, item give, and a raw console fallback.
-
-![screenshot placeholder](docs/screenshots/panel.png)
+AdmiralsPanel gives you a web UI with buttons, sliders, and presets so you never have to type RCON commands again. Live player list, per-player speed, server multipliers (xp / weight / loot / stack / craft cost / harvest yield / crop speed / points-per-level), difficulty presets, announcements, heal/feed/kill/teleport buttons, item give, and a raw console fallback.
 
 ## Prerequisites
 
-- A Windrose Dedicated Server install on Windows.
-- UE4SS installed in `R5/Binaries/Win64/ue4ss/`.
-- **v0.6+ (standalone, default)**: nothing else required. The native DLL
-  hosts its own HTTP server on port 8790 and auto-generates
-  `admiralspanel.json` with a fresh random password on first run.
-- **v0.5 and earlier (or `-WithWindrosePlus` install)**: [WindrosePlus](https://github.com/HumanGenome/WindrosePlus)
-  v1.0.7+ installed and running; RCON password set in `windrose_plus.json`.
+- A Windrose Dedicated Server install on Windows (Steam DS SKU).
+- **UE4SS** installed at `R5/Binaries/Win64/ue4ss/`. Get the latest release from <https://github.com/UE4SS-RE/RE-UE4SS/releases/latest> and extract the contents into `R5/Binaries/Win64/`. The installer below will fail with a friendly message if UE4SS is missing.
+- That's it for the standalone (default) install. The native DLL hosts its own HTTP server on port 8790 and writes `admiralspanel.json` with a fresh random password on first run.
+- **Optional, legacy**: if you already run [WindrosePlus](https://github.com/HumanGenome/WindrosePlus) v1.0.7+ and want AdmiralsPanel served from its dashboard instead, pass `-WithWindrosePlus` to `install.ps1`.
 
 ## Install
 
@@ -59,47 +54,69 @@ Two options:
 
 > **After you update WindrosePlus, re-run `install.ps1`.** WindrosePlus's installer wipes `server/web/` on every update, which removes our panel. Re-running restores it in ~5 seconds.
 
-## Use
+## Use (standalone, default)
 
-1. Start your server with WindrosePlus's `StartWindrosePlusServer.bat` as usual.
-2. Start the WindrosePlus dashboard with `windrose_plus\start_dashboard.bat`.
-3. Open your browser to `http://localhost:8780/`, log in with your RCON password.
-4. Navigate to `http://localhost:8780/admiral.html` (or the direct URL `http://localhost:8780/admiral/index.html`).
+1. Start (or restart) your Windrose dedicated server with your usual startup script (e.g. `StartServerForeground.bat`). The native DLL spins up its own HTTP server on port 8790.
+2. The first server start writes `admiralspanel.json` at the server root with a random password.
+3. Open `http://localhost:8790/` in a browser on the server (or from another machine if port 8790 is allowed through your firewall).
+4. Log in with the password from `admiralspanel.json` ("password" field).
 
-## What it can do (v0.2)
+Verify the panel is up before opening the browser:
+```powershell
+curl http://localhost:8790/healthcheck
+# expect: {"status":"ok","app":"AdmiralsPanel","version":"0.7.0"}
+```
 
-**Pure Lua** (no extra install):
+## What it can do (v0.7)
 
-- Per-player speed slider (via WindrosePlus's `wp.speed`).
-- Server-wide multipliers: loot, XP, weight, craft cost, stack size, crop/cooking speed, inventory size, points per level, harvest yield. Persisted to `windrose_plus.json`.
-- Difficulty presets: Vanilla / Easy / Hard / Event: 2× XP / Event: 2× Loot / Event: Chill.
-- **Teleport** (`ap.tp`, `ap.tpxyz`) — server-authoritative via `K2_TeleportTo`.
-- Announcements, live player list, admin log, raw RCON console.
+**World-tab multipliers** — all live, write directly to the game's reflected data assets:
 
-**With the optional `AdmiralsPanelNative.dll`** (C++ companion, see [`cpp/`](cpp/)):
+| Slider | Targets |
+|---|---|
+| **XP** | `R5BLQuestParams.ExperienceCount` — 232 quests on a stock world |
+| **Weight** | `R5WeightAttributeSet.MaxWeightCapacity` per online player |
+| **Loot** | Slot counts on populated `R5LootActor` instances (post-spawn, 2s tick) |
+| **Stack size** | `R5BLInventoryItemGPP.MaxCountInSlot` — 1268 item assets |
+| **Craft cost** | `R5BLRecipeData.RecipeCost` array — 2257 recipes, ~3500 cost entries |
+| **Harvest yield** | `R5BLLootData` + 5 other variants — 1500+ loot tables |
+| **Crop speed** | `R5BLCropParams.GrowthDuration` — 22 crops |
+| **Points / level** | `TalentPointsReward` + `StatPointsReward` per level entry |
+| **Coop scale** | `Coop_StatsCorrectionModifier` WDS param (experimental knob) |
 
-- `ap.healn` / `ap.damagen` / `ap.killn` / `ap.feedn` / `ap.reviven` — real health mods via direct GAS attribute writes (server-authoritative, replicates to clients).
-- `ap.setattrn` / `ap.readattrn` — touch any of the ~100 `R5AttributeSet` fields (MaxHealth, Armor, Damage, all damage-type multipliers, crit stats, etc.). "God mode" and "500 damage/hit" are one command each.
-- `ap.giveloot <player> [count]` — teleport populated `R5LootActor` instances in the world to a player; auto-pickup delivers their contents (fiber, wood, food, etc. — whatever was in the loot actor).
-- `ap.giveitem <player> <search>` — teleport a populated loot actor whose contents match `search` (e.g. `ap.giveitem Mancave banana`). Scans each LootView's memory for references to known `UR5BLInventoryItem` data assets; substring-matches on the short name. Pair with `ap.lootitems` to see what's available in the world first, or `ap.itemlist <search>` to see what items exist at all.
-- `ap.yankactorn` / `ap.spawnn` / `ap.lootlistn` / `ap.lootinspectn` / `ap.itemscan` and a full RE toolkit (`rawdumpn` / `dumpclassn` / `funcparamsn` / `scanpath` / `findclassn` / `locn`) for further reverse-engineering.
-- See [`docs/native-mod.md`](docs/native-mod.md) for the technical writeup, including how `ap.giveitem` identifies items without decoding the DropView's non-reflected slot structure.
+Each captures originals on first sight and restores cleanly when set to 1.0. **Loot and harvest_yield are capped at 4× in the UI** because the game runtime applies its own post-roll scaling; values higher than that don't take effect.
 
-**Still not done** (v0.5 roadmap):
+**Difficulty presets** — Vanilla, Easy, Hard, plus three weekend-event presets (2× XP, 2× Loot, 3× Points) and "Event: Chill" (relaxed build mode). One click applies a multiplier bundle; partial presets only touch their own keys.
 
-- In-game chat broadcast — `ClientMessage` is an RPC and UE4SS struggles with it. Looking for a non-RPC path.
-- Give-item with an arbitrary count / arbitrary item (not just what's currently in the world). Would require decoding the C++-only rule dispatcher — pattern-scanning the game binary, multi-session RE.
-- UI buttons for the native commands — right now they work via the dashboard console only.
-- Scheduled server actions (cron-style restarts, timed multiplier swaps, etc.).
+**Players tab**:
+- Live player list with positions, speed slider, "TP to last death" button.
+- `ap.healn` / `ap.damagen` / `ap.killn` / `ap.feedn` / `ap.reviven` — direct GAS attribute writes.
+- `ap.setattrn` / `ap.readattrn` — read/write any of ~150 `R5AttributeSet` fields (MaxHealth, Armor, Damage, all damage-type modifiers, crit stats, etc.).
+- `ap.giveloot <player> [count]` — teleport populated `R5LootActor` instances to the player; their auto-pickup ability delivers the contents.
+- `ap.giveitem <player> <search>` — teleport a loot actor whose contents match a substring (e.g. `ap.giveitem Mancave banana`).
+- `ap.tp` / `ap.tpxyz` — server-authoritative teleport.
+
+**Admin tools**:
+- Announcements (writes to server log + `events.log`).
+- Admin action log (every `ap.*` command persisted).
+- Raw RCON console fallback.
+- Full RE toolkit (`rawdumpn` / `dumpclassn` / `funcparamsn` / `scanpath` / `classprobe` / `findclassn` / `lootitems` / `itemlist` / `inspect`) for digging into `UObject` reflection.
+
+**Known limitations**:
+- In-game chat broadcast — `ClientMessage` is an RPC; we can't fire it cleanly through UE4SS yet.
+- "Inventory size" and "Cooking speed" multipliers — the underlying systems either need TArray growth (crash risk) or live in non-reflected data; neither is shipped.
+- Loot multiplier on tree-chop drops — auto-pickup races our 2s tick, so quick tree chops don't multiply. Use `harvest_yield` for that path; it modifies the loot table before it rolls.
 
 ## How it works
 
-AdmiralsPanel is two pieces:
+AdmiralsPanel (v0.6+) is three pieces:
 
-- **Lua mod** — loaded by WindrosePlus. Adds new `ap.*` RCON commands.
-- **Web UI** — a single HTML page (no build step; Tailwind via CDN). Served by the WindrosePlus dashboard at `/admiral/`. Reuses the dashboard's login cookie — no auth to configure.
+- **`AdmiralsPanelNative.dll`** — UE4SS C++ mod. Hosts the HTTP server on port 8790, serves the web UI, handles login + session cookies, dispatches RCON commands into the Lua mod via a small file-based spool, AND does the heavy lifting (GAS attribute writes, loot-actor teleport, multiplier writebacks, UObject scans).
+- **Lua mod** (`AdmiralsPanel`) — UE4SS Lua mod loaded by UE4SS itself. Registers the `ap.*` commands, handles the spool tick, persists multiplier values to `admiralspanel.json`.
+- **Web UI** — single HTML/CSS/JS page (no build step, Tailwind via CDN), served by the native DLL.
 
-See [`docs/architecture.md`](docs/architecture.md) for details.
+No WindrosePlus dependency. No external dashboard. One process, one port, one config file.
+
+See [`docs/architecture.md`](docs/architecture.md) for the details on the spool protocol and the native bridge.
 
 ## Contributing
 

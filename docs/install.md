@@ -1,105 +1,121 @@
 # Install guide
 
-## Prerequisites
+AdmiralsPanel v0.6+ ships **standalone** — the panel's own native DLL hosts an HTTP server on port 8790. No WindrosePlus needed. Re-running the installer is always safe; it is idempotent.
 
-1. **Windrose Dedicated Server** running on Windows. Get it via Steam (AppID for the dedicated server variant).
-2. **[WindrosePlus](https://github.com/HumanGenome/WindrosePlus) v1.0.7 or later**, installed. AdmiralsPanel is a plugin on top of WindrosePlus — it does not replace it. If you haven't installed WindrosePlus yet:
-   ```powershell
-   # From the WindrosePlus zip, extract into your server folder and run:
-   powershell -ExecutionPolicy Bypass -File install.ps1
-   ```
-3. **An RCON password set** in `windrose_plus.json` — not the default `changeme`. Edit the file, set a password, restart the server.
-
-## Install AdmiralsPanel
+## TL;DR
 
 ```powershell
-# 1. Clone or download the repo
 git clone https://github.com/Mancavegaming/admiral-admin.git
 cd admiral-admin
-
-# 2. Run the installer
 powershell -ExecutionPolicy Bypass -File install.ps1
+# restart the server, then open http://localhost:8790/
 ```
 
-The installer auto-detects your Windrose server folder in common Steam paths. If it can't find it, pass `-GameDir` explicitly:
+The installer auto-detects your Windrose server folder in common Steam paths. If it cannot, pass `-GameDir`:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File install.ps1 -GameDir "D:\SteamLibrary\steamapps\common\Windrose Dedicated Server"
 ```
 
-## What gets installed where
+## Prerequisites
+
+1. **Windows server** running the Windrose Dedicated Server (Steam SKU).
+2. **UE4SS** installed at `R5\Binaries\Win64\ue4ss\`. Latest release: <https://github.com/UE4SS-RE/RE-UE4SS/releases/latest>. Extract the contents of the release zip into `R5\Binaries\Win64\`. The installer fails with a friendly message and a link if UE4SS is missing.
+3. **The native DLL** at `cpp\dist\main.dll` inside the cloned repo. Two ways to get it — see "Native DLL" below.
+4. **PowerShell 5.1+** (ships with Windows Server 2019/2022/2025). The installer file is strict ASCII so PS 5.1's UTF-8-without-BOM quirk does not bite.
+
+## What gets installed where (standalone)
 
 | Source | Destination | Notes |
 |--------|-------------|-------|
-| `mod/` | `R5\Binaries\Win64\ue4ss\Mods\WindrosePlus\Mods\admiral-admin\` | Lua mod. Registered in `mods_registry.json`. **Survives WindrosePlus updates.** |
-| `web/` | `windrose_plus\server\web\admiral\` | Web panel static files. **WIPED by WindrosePlus updates — re-run install.ps1.** |
-| (generated) | `windrose_plus\server\web\admiral.html` | Redirect helper for the shorter URL. |
+| `mod\init.lua` + `mod\Scripts\` + `mod\data\` + `mod\lib\` | `R5\Binaries\Win64\ue4ss\Mods\AdmiralsPanel\Scripts\` | Lua mod. Survives server restarts. |
+| `cpp\dist\main.dll` | `R5\Binaries\Win64\ue4ss\Mods\AdmiralsPanelNative\dlls\main.dll` | Native HTTP server + GAS / loot bridges. |
+| (writes) | `R5\Binaries\Win64\ue4ss\Mods\mods.txt` | Adds `AdmiralsPanelNative : 1` if absent. |
+| `web\*` | `admiralspanel_data\web\` | Static web UI files served by the native DLL. |
+| (generated on first server start) | `admiralspanel.json` (server root) | Login password + multiplier persistence. |
 
-## Verify install
+## Native DLL
 
-1. Restart the server (or wait up to 30 seconds for the WindrosePlus file-watcher to hot-reload the mod).
-2. Inspect `R5\Binaries\Win64\ue4ss\UE4SS.log` — you should see:
-   ```
-   [WindrosePlus:API] INFO: Mod command registered: ap.setmult
-   [WindrosePlus:API] INFO: Mod command registered: ap.preset
-   [WindrosePlus:API] INFO: Mod command registered: ap.say
-   [WindrosePlus:API] INFO: Mod command registered: ap.bringall
-   [WindrosePlus:API] INFO: Mod command registered: ap.adminlog
-   [WindrosePlus:AdmiralsPanel] INFO: AdmiralsPanel v0.1.0 loaded - ...
-   [WindrosePlus:Mods] INFO: Loaded: AdmiralsPanel v0.1.0
-   ```
-3. Start the WindrosePlus dashboard:
-   ```
-   <server_folder>\windrose_plus\start_dashboard.bat
-   ```
-4. Open `http://localhost:8780/` in a browser, log in with your RCON password.
-5. Navigate to `http://localhost:8780/admiral.html` — you should see the panel.
+The DLL is required — without it the HTTP server does not start and the panel does not load. Two ways:
 
-## After updating WindrosePlus
+- **Download (recommended for users):** grab `AdmiralsPanelNative-<version>.dll` from [the latest release](https://github.com/Mancavegaming/admiral-admin/releases/latest), rename to `main.dll`, and drop it at `cpp\dist\main.dll` in the cloned repo. Then run `install.ps1`.
+- **Build from source (developers):** requires Visual Studio 2022 Build Tools with the C++ workload + Windows SDK + an Epic Games / GitHub account link (UEPseudo submodule). One command:
+  ```powershell
+  cd cpp
+  powershell -ExecutionPolicy Bypass -File build.ps1
+  ```
+  See `cpp\README.md` for the full toolchain list.
 
-The WindrosePlus installer wipes `server/web/` on every update. To restore the panel:
+## Verify the install
+
+After running `install.ps1`, restart the server and wait ~30 seconds for the world to load. Then:
+
+```powershell
+curl http://localhost:8790/healthcheck
+# expect: {"status":"ok","app":"AdmiralsPanel","version":"0.7.0"}
+```
+
+If you get `Unable to connect`, check in this order:
+
+1. **Server actually started?** `tasklist /FI "IMAGENAME eq WindroseServer-Win64-Shipping.exe"` should show a process.
+2. **DLL deployed?** Check `R5\Binaries\Win64\ue4ss\Mods\AdmiralsPanelNative\dlls\main.dll` exists and has a recent timestamp.
+3. **Mod enabled?** `R5\Binaries\Win64\ue4ss\Mods\mods.txt` should contain `AdmiralsPanelNative : 1` (the installer adds it).
+4. **Port collision?** If something else is on 8790, edit the `http_port` field in `admiralspanel.json` and restart the server.
+5. **Server log:** `R5\Saved\Logs\R5.log` — search for `AdmiralsPanel`. Errors there will name the issue.
+
+Once `/healthcheck` responds, open `http://localhost:8790/` and log in with the password from `admiralspanel.json`.
+
+## Updating
 
 ```powershell
 cd admiral-admin
+git pull
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-Re-running is safe — everything is idempotent. Takes ~5 seconds. The Lua mod under `ue4ss\Mods\WindrosePlus\Mods\admiral-admin\` is NOT wiped by WindrosePlus updates, but re-running picks up any updates to the mod itself too.
+Re-running the installer overwrites Lua scripts and web assets in place. The DLL is overwritten too if you've staged a newer one; if the server is running it will detect the lock and either no-op (file unchanged) or warn (file differs — stop the server first).
 
-## Uninstall
+Multiplier values in `admiralspanel.json` are preserved across updates.
+
+## Sub-mod install (legacy, optional)
+
+If you already run [WindrosePlus](https://github.com/HumanGenome/WindrosePlus) v1.0.7+ and want AdmiralsPanel served from WP's dashboard at `http://localhost:8780/admiral.html` instead of the standalone server:
 
 ```powershell
-# Remove the mod
-Remove-Item -Recurse -Force "<server>\R5\Binaries\Win64\ue4ss\Mods\WindrosePlus\Mods\admiral-admin"
-
-# Remove from registry
-$path = "<server>\R5\Binaries\Win64\ue4ss\Mods\WindrosePlus\Mods\mods_registry.json"
-$reg = @(Get-Content $path -Raw | ConvertFrom-Json) | Where-Object { $_ -ne "admiral-admin" }
-ConvertTo-Json $reg -Compress | Set-Content $path
-
-# Remove the web panel
-Remove-Item -Recurse -Force "<server>\windrose_plus\server\web\admiral"
-Remove-Item -Force "<server>\windrose_plus\server\web\admiral.html"
+powershell -ExecutionPolicy Bypass -File install.ps1 -WithWindrosePlus
 ```
 
-Restart the server to complete the unload.
+The Lua mod lands at `R5\Binaries\Win64\ue4ss\Mods\WindrosePlus\Mods\admiral-admin\` (registered in `mods_registry.json`) and the web UI at `windrose_plus\server\web\admiral\`. WindrosePlus's installer wipes `server\web\` on every WP update — re-run `install.ps1 -WithWindrosePlus` afterwards to restore the panel (~5 seconds).
 
 ## Troubleshooting
 
-**The mod doesn't show up in `UE4SS.log`.**
-Check `R5\Binaries\Win64\ue4ss\Mods\WindrosePlus\Mods\mods_registry.json` — it should include `"admiral-admin"`. If not, the installer had a problem — re-run it.
+**Installer error: "UE4SS not installed"** — extract the latest UE4SS release from <https://github.com/UE4SS-RE/RE-UE4SS/releases/latest> into `R5\Binaries\Win64\`, then re-run the installer.
 
-**`/admiral.html` returns 404.**
-You installed the Lua mod but the web panel didn't copy (perhaps you ran install.ps1 from a partial clone). Re-run install.ps1 from the full repo.
+**`/healthcheck` returns "Unable to connect"** — see "Verify the install" above; usually the DLL didn't load. Check `R5\Saved\Logs\R5.log` for `AdmiralsPanel` lines.
 
-**Commands return "Player 'X' not found" but I AM connected.**
-Check the exact case — WindrosePlus's RCON is case-insensitive on player names via our helper, but if you've reconnected recently, WindrosePlus may briefly show a stale PlayerController. Wait 5-10 seconds after reconnect.
+**`/healthcheck` works but `/api/status` returns 401** — clear cookies and re-login. The session cookie expired or the server password rotated.
 
-**"Authentication required" on every API call.**
-The dashboard session cookie is missing or expired. Log into the dashboard at `http://localhost:8780/` first, then reload `/admiral.html`.
+**Login page accepts password but redirects to login again** — the password in `admiralspanel.json` was changed and your browser cached the old one. Hard-refresh.
 
-**Multiplier doesn't seem to apply in-game.**
-Some multipliers may be baked at world load or level load rather than read per-event. Try a full server restart. If the value persists across restarts (check `windrose_plus.json`) but the in-game effect is still missing, that particular multiplier is in the "not live" bucket — open a GitHub issue with which one.
+**Multipliers persist to JSON but nothing happens in-game** — check the slider's badge: `live` means the native impl ran, `unwired` means we don't have a hook for that key yet. For `live` keys, give the world ~3 seconds after server start so the startup re-apply has time to run.
 
-**"Command timed out (25s)".**
-Windrose + WindrosePlus queues commands in a spool file the game Lua state polls. Under heavy load or mid-level-transition, processing can lag. Usually transient — re-try.
+**"Command timed out (25s)"** — usually transient (server is mid-level-transition or under heavy load). Re-try. The "Vanilla" preset in particular takes ~17s because it walks every UObject 8 times.
+
+**Loot multiplier doesn't affect tree-chop drops** — the auto-pickup ability collects them faster than the 2-second multiplier tick. Use `harvest_yield` instead; it modifies the loot tables before they roll.
+
+**Harvest yield set to 9 only gives ~3-4x** — the Windrose runtime applies its own post-roll scaling. The slider is capped at 4× in the UI to reflect the practical ceiling. The experimental `coop_scale` knob targets `Coop_StatsCorrectionModifier` but did not lift the cap in our testing.
+
+## Uninstall
+
+Stop the server, then:
+
+```powershell
+$g = "C:\Program Files (x86)\Steam\steamapps\common\Windrose Dedicated Server"
+Remove-Item "$g\R5\Binaries\Win64\ue4ss\Mods\AdmiralsPanel" -Recurse -Force
+Remove-Item "$g\R5\Binaries\Win64\ue4ss\Mods\AdmiralsPanelNative" -Recurse -Force
+# optional: keep your password + multiplier settings
+Remove-Item "$g\admiralspanel.json"
+Remove-Item "$g\admiralspanel_data" -Recurse -Force
+# remove from UE4SS mod list
+(Get-Content "$g\R5\Binaries\Win64\ue4ss\Mods\mods.txt") -notmatch '^AdmiralsPanelNative' | Set-Content "$g\R5\Binaries\Win64\ue4ss\Mods\mods.txt"
+```

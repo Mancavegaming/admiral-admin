@@ -61,7 +61,15 @@ if ([string]::IsNullOrEmpty($repoRoot)) { $repoRoot = $PWD.Path }
 
 $ue4ssMods = Join-Path $GameDir "R5\Binaries\Win64\ue4ss\Mods"
 if (-not (Test-Path -LiteralPath $ue4ssMods)) {
-    Write-Fail "UE4SS not installed at $ue4ssMods — install UE4SS first."
+    Write-Fail "UE4SS not installed at $ue4ssMods"
+    Write-Host ""
+    Write-Host "  AdmiralsPanel runs as a UE4SS mod. Install UE4SS first:" -ForegroundColor Yellow
+    Write-Host "    1. Download the latest release from:" -ForegroundColor Yellow
+    Write-Host "         https://github.com/UE4SS-RE/RE-UE4SS/releases/latest" -ForegroundColor Yellow
+    Write-Host "    2. Extract the contents into:" -ForegroundColor Yellow
+    Write-Host "         $GameDir\R5\Binaries\Win64\" -ForegroundColor Yellow
+    Write-Host "    3. Re-run this installer." -ForegroundColor Yellow
+    Write-Host ""
     exit 1
 }
 
@@ -97,7 +105,7 @@ if (-not $WithWindrosePlus) {
     $oldSub = Join-Path $ue4ssMods "WindrosePlus\Mods\admiral-admin"
     if (Test-Path -LiteralPath $oldSub) {
         Write-Warn "Old WindrosePlus sub-mod install detected at $oldSub"
-        Write-Info "Both modes run in parallel — remove the sub-mod if you no longer use WindrosePlus."
+        Write-Info "Both modes run in parallel - remove the sub-mod if you no longer use WindrosePlus."
     }
 
     Write-Step "2/4" "Installing web panel..."
@@ -142,14 +150,31 @@ if (-not $WithWindrosePlus) {
     if (-not $alreadyN) { Add-Content -Path $modsTxt -Value "AdmiralsPanelNative : 1" }
 
     Write-Step "4/4" "Done."
+
+    # --- Pick the right server start script depending on what's installed ---
+    $startWp = Join-Path $GameDir "StartWindrosePlusServer.bat"
+    $startVa = Join-Path $GameDir "StartServerForeground.bat"
+    $startScript = $null
+    if (Test-Path -LiteralPath $startWp) { $startScript = $startWp }
+    elseif (Test-Path -LiteralPath $startVa) { $startScript = $startVa }
+
     Write-Host ""
     Write-Host "  Next steps:" -ForegroundColor Cyan
-    Write-Host "    1. Start (or restart) the server: $GameDir\StartWindrosePlusServer.bat"
-    Write-Host "       (the script starts WindrosePlus too, but our HTTP server is independent)"
-    Write-Host "    2. First run generates admiralspanel.json with a random password at the server root."
-    Write-Host "    3. Open http://localhost:8790/ in a browser on the server"
-    Write-Host "       (or from another machine once the firewall allows port 8790)."
-    Write-Host "    4. Log in with the password from admiralspanel.json -> rcon.password."
+    if ($startScript) {
+        Write-Host "    1. Start (or restart) the server:" -ForegroundColor White
+        Write-Host "         $startScript" -ForegroundColor Gray
+    } else {
+        Write-Host "    1. Start (or restart) the server with your usual startup script." -ForegroundColor White
+    }
+    Write-Host "    2. First server start writes:" -ForegroundColor White
+    Write-Host "         $GameDir\admiralspanel.json" -ForegroundColor Gray
+    Write-Host "       with a random password (the file's `"password`" field)." -ForegroundColor White
+    Write-Host "    3. Open http://localhost:8790/ in a browser on the server" -ForegroundColor White
+    Write-Host "       (or from another machine once the firewall allows port 8790)." -ForegroundColor White
+    Write-Host "    4. Log in with the password from admiralspanel.json." -ForegroundColor White
+    Write-Host ""
+    Write-Host "  Verify (after the server is up, ~30s):" -ForegroundColor Cyan
+    Write-Host "    curl http://localhost:8790/healthcheck" -ForegroundColor Gray
     Write-Host ""
     exit 0
 }

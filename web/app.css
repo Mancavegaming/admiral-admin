@@ -75,6 +75,28 @@ body { background: var(--ink); color: var(--cream); }
     font-size: 1.1rem;
 }
 .mult-desc   { font-size: 0.75rem; color: rgba(237, 224, 204, 0.55); margin-top: 4px; }
+.mult-badge {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 1px 8px;
+    border-radius: 9999px;
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    vertical-align: 1px;
+    cursor: help;
+}
+.mult-badge-live {
+    background: rgba(96, 200, 96, 0.15);
+    color: #6ec76e;
+    border: 1px solid rgba(96, 200, 96, 0.4);
+}
+.mult-badge-stub {
+    background: rgba(200, 96, 96, 0.15);
+    color: #d68b8b;
+    border: 1px solid rgba(200, 96, 96, 0.4);
+}
 .mult-slider {
     width: 100%;
     accent-color: var(--gold);

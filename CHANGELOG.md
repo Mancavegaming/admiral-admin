@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file. Format is l
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-04-28
+
+World-tab multipliers actually work now. The whole "World" tab was previously a lie — every slider wrote to non-existent properties on `R5GameMode` and the success message was fabricated by UE4SS's pcall silently swallowing the no-op writes.
+
+### Added
+
+- **8 native multiplier impls**, each writing to the actual reflected data assets the game reads:
+  - **xp** — `R5BLQuestParams.ExperienceCount` (881 quests, 232 award non-zero XP)
+  - **weight** — `R5WeightAttributeSet.MaxWeightCapacity` per online player
+  - **loot** — slot counts on populated `R5LootActor` instances (post-spawn, 2s `LoopAsync` tick)
+  - **stack_size** — `R5BLInventoryItemGPP.MaxCountInSlot` (1268 item assets)
+  - **craft_cost** — `R5BLRecipeData.RecipeCost` TArray (2257 recipes, ~3500 cost entries)
+  - **harvest_yield** — generic `FArrayProperty<known loot-data variant>` walker covering `R5BLLootData`, `R5LootData`, `R5FoliageLootData`, `FoliageLootData`, `R5DropLootData`, `R5DigVolumeLootData` (1500+ loot tables)
+  - **crop_speed** — `R5BLCropParams.GrowthDuration` (FTimespan, 22 crops)
+  - **points_per_level** — `R5BLEntityProgressionLevelParams.Levels[i].TalentPointsReward` + `StatPointsReward` (player + ship level tables)
+- **`coop_scale` knob** — direct override of `Coop_StatsCorrectionModifier` WDS param's `DefaultValue`. Experimental (didn't lift the loot post-roll cap in our testing) but available for future use.
+- **Periodic ticks** — `loot_tick` (catches new R5LootActor spawns) and `harvest_tick` (catches loot tables that stream in lazily). Both no-op when factor is 1.0.
+- **Reflection-driven offsets** for all TArray walks — `FArrayProperty::GetInner()->GetElementSize()` for stride, `FStructProperty::GetStruct()->GetPropertyByNameInChain(field)->GetOffset_Internal()` for field offsets within elements. Hardcoded offsets caused the v0.6 craft_cost+harvest_yield crash on player connect.
+- **Per-multiplier originals tracking** — every native impl captures original values on first sight (keyed by UObject* / array offset) so factor=1.0 cleanly restores defaults across slider movements.
+- **Honest UI badges** — every World-tab slider shows a `live` (green) or `unwired` (red) badge so admins know which dials actually take effect. The old code lied by saying `(live: XPMultiplier)` for every multiplier including the 100% phantom ones.
+- **Startup re-apply** — Lua mod reads persisted multipliers from `admiralspanel.json` and pushes them through native impls 3 seconds after server start.
+- **`Event: 3× Points` preset** for skill-tree events.
+
+### Changed
+
+- **Removed `cooking_speed` and `inventory_size` from the panel.** Cooking uses non-reflected `R5ConvertedItemRecipeData`; inventory size would require runtime TArray growth (crash risk). Both were "unwired" stubs that did nothing — better to drop them than mislead.
+- **`loot` and `harvest_yield` sliders capped at 4×.** The Windrose runtime applies its own post-roll loot scaling that caps effective drops around 3-4×; values above 4 don't take effect. The cap is documented in each slider's tooltip.
+- **`event-loot` preset now also doubles `harvest_yield`.** They compound at different stages of the loot pipeline.
+- **`event-chill` preset** dropped `cooking_speed`, kept `crop_speed=2`.
+- **Web UI version display** updated to v0.7.0.
+- **Installer** — friendlier messages when UE4SS is missing (with a download link), auto-detects the right server-start script (`StartWindrosePlusServer.bat` vs `StartServerForeground.bat`), prints a `curl /healthcheck` verify command at the end.
+- **Documentation** — `README.md` and `docs/install.md` rewritten standalone-first, dropping WindrosePlus-required instructions. Added troubleshooting section.
+
+### Fixed
+
+- **Crash on player connect** when craft_cost or harvest_yield had been used during the session. Root cause: hardcoded element strides for TArrays — fixed by switching to `GetInner()->GetElementSize()` reflection, plus `is_readable` checks before each write.
+- **`/api/status`** now returns the `multipliers` map (was missing entirely in v0.6, so the World-tab sliders always rendered at 1.0×).
+- **The lying-success-message bug** — old code wrote to `R5GameMode[XPMultiplier]` etc. via UE4SS pcall, which silently accepts writes to non-existent properties. Result message claimed `(live: XPMultiplier)` while doing nothing. Replaced with honest reporting.
+
 ## [0.6.0] — 2026-04-24
 
 Standalone mode — AdmiralsPanel no longer requires WindrosePlus.
