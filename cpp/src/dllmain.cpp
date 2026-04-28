@@ -53,6 +53,8 @@ static std::unordered_set<uintptr_t> gather_live_uobjects();
 static std::wstring get_loot_source_name_safe(
     UObject* loot_view,
     const std::unordered_set<uintptr_t>& live);
+static bool is_code_like_ptr(uintptr_t v);
+static bool is_readable(const void* p, size_t len);
 
 // ---------------------------------------------------------------------------
 // Small string helpers (wide <-> narrow, lossy ASCII-only — fine for names)
@@ -512,6 +514,969 @@ static int lua_setattr(const LuaMadeSimple::Lua& lua)
                   static_cast<double>(before),
                   static_cast<double>(val), ok ? "OK" : "FAIL");
     lua.set_string(std::string(buf));
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// World multipliers — native dispatch
+// Walks all online players and applies a configured multiplier directly to
+// the relevant attribute. Originals are captured on first sight, so applying
+// 2x then 1x cleanly restores the un-multiplied default.
+// ---------------------------------------------------------------------------
+
+// Iterate all PlayerControllers and call cb for each (controller, state, pawn,
+// name). cb returns true to stop early.
+template <typename F>
+static void for_each_player(F&& cb)
+{
+    UObjectGlobals::ForEachUObject([&](UObject* obj, int32, int32) {
+        if (!obj) return LoopAction::Continue;
+        auto* cls = obj->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        auto cls_name = cls->GetName();
+        if (std::wstring_view(cls_name).find(STR("PlayerController")) == std::wstring_view::npos)
+            return LoopAction::Continue;
+
+        UObject* ps = nullptr;
+        {
+            auto* prop = obj->GetPropertyByNameInChain(STR("PlayerState"));
+            if (!prop) return LoopAction::Continue;
+            auto** ptr = prop->ContainerPtrToValuePtr<UObject*>(obj);
+            if (!ptr || !*ptr) return LoopAction::Continue;
+            ps = *ptr;
+        }
+
+        std::wstring name_str;
+        {
+            auto* prop = ps->GetPropertyByNameInChain(STR("PlayerNamePrivate"));
+            if (prop) {
+                auto* fs = prop->ContainerPtrToValuePtr<FString>(ps);
+                if (fs && **fs) name_str = **fs;
+            }
+        }
+
+        AActor* pawn = nullptr;
+        {
+            auto* prop = obj->GetPropertyByNameInChain(STR("Pawn"));
+            if (prop) {
+                auto** ptr = prop->ContainerPtrToValuePtr<AActor*>(obj);
+                if (ptr) pawn = *ptr;
+            }
+        }
+
+        PlayerRef p{obj, ps, pawn, name_str};
+        if (cb(p)) return LoopAction::Break;
+        return LoopAction::Continue;
+    });
+}
+
+// PlayerState ptr -> original BaseValue captured on first apply. Survives the
+// process lifetime; cleared naturally on server restart (player reconnects ->
+// new PlayerState -> first observation captures fresh default).
+static std::unordered_map<UObject*, float> g_weight_originals;
+
+// Apply weight multiplier to all online players. Returns "<count> updated"
+// string, or an error message.
+static std::string apply_weight_multiplier(float factor)
+{
+    int updated = 0, missing_set = 0, total = 0;
+    for_each_player([&](const PlayerRef& p) {
+        ++total;
+        UObject* set = find_set_with_attribute(p, STR("MaxWeightCapacity"));
+        if (!set) { ++missing_set; return false; }
+
+        float current_base = 0;
+        if (!read_attribute(set, STR("MaxWeightCapacity"), nullptr, &current_base)) return false;
+
+        // Capture original on first sight. If already mapped, current_base is
+        // probably already-multiplied from a previous call — don't overwrite.
+        auto it = g_weight_originals.find(p.state);
+        if (it == g_weight_originals.end()) {
+            g_weight_originals[p.state] = current_base;
+            it = g_weight_originals.find(p.state);
+        }
+        float new_base = it->second * factor;
+        write_attribute(set, STR("MaxWeightCapacity"), new_base, /*also_base=*/true);
+        ++updated;
+        return false;
+    });
+
+    char buf[160];
+    if (total == 0) {
+        std::snprintf(buf, sizeof(buf),
+            "weight x%.2f saved; no players online to apply to live", static_cast<double>(factor));
+    } else if (missing_set == total) {
+        std::snprintf(buf, sizeof(buf),
+            "weight x%.2f saved; %d player(s) online but R5WeightAttributeSet not yet spawned",
+            static_cast<double>(factor), total);
+    } else {
+        std::snprintf(buf, sizeof(buf),
+            "weight x%.2f live on %d/%d player(s)%s",
+            static_cast<double>(factor), updated, total,
+            missing_set ? " (rest missing weight set)" : "");
+    }
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// Loot multiplier
+// Walks each populated R5LootActor's LootView at +0x100..0x2C0 for slot
+// pointers (R5BLInventorySlotView, sharing the LootView's heap-arena tag).
+// Each slot stores its stack count as int32 at +0x58 (per prior RE notes,
+// project_windrose_inventory.md). We multiply that count once per actor —
+// each LootActor goes through this exactly once during its lifetime.
+//
+// Strategy: setting `loot 2.0` records the factor; future spawns get caught
+// by the Lua-driven loot-tick that re-invokes us. Slider changes don't
+// retroactively re-multiply already-processed actors (avoids compounding).
+// ---------------------------------------------------------------------------
+
+static float g_loot_factor = 1.0f;
+static std::unordered_set<UObject*> g_loot_processed;
+
+// Helper: read int32 we believe to be a slot count, multiply by factor,
+// round-half-up, write back. Returns true if we wrote something.
+// We refuse to write counts that would underflow or look insane (>1e6).
+static bool multiply_slot_count(uintptr_t slot_addr, float factor)
+{
+    uint8_t* slot = reinterpret_cast<uint8_t*>(slot_addr);
+    int32_t* count_ptr = reinterpret_cast<int32_t*>(slot + 0x58);
+    int32_t before = *count_ptr;
+    if (before <= 0 || before > 1000000) return false;
+    int32_t after = static_cast<int32_t>(static_cast<float>(before) * factor + 0.5f);
+    if (after < 1) after = 1;
+    if (after > 1000000) return false;
+    if (after == before) return false;
+    *count_ptr = after;
+    return true;
+}
+
+// Apply factor to one R5LootActor's slots. Returns number of slots written.
+static int apply_loot_to_actor(UObject* actor, float factor)
+{
+    UObject* loot_view = *reinterpret_cast<UObject**>(
+        reinterpret_cast<uint8_t*>(actor) + 0x310);
+    if (!loot_view) return 0;
+
+    const uint8_t* lv_bytes = reinterpret_cast<const uint8_t*>(loot_view);
+    uintptr_t lv_arena = reinterpret_cast<uintptr_t>(loot_view) >> 40;
+
+    int written = 0;
+    for (size_t off = 0x100; off + 8 <= 0x2C0; off += 8) {
+        uintptr_t v = *reinterpret_cast<const uintptr_t*>(lv_bytes + off);
+        if ((v >> 40) != lv_arena) continue;
+        if ((v & 7) != 0) continue;
+        const void* p = reinterpret_cast<const void*>(v);
+        if (!is_readable(p, 0x60)) continue;
+
+        // Sanity: slot must look UObject-shaped (code-like vtable + same-arena
+        // class ptr at +0x10 with its own code-like vtable). Filters false
+        // positives that happen to share the arena tag.
+        uintptr_t v_vtable = *reinterpret_cast<const uintptr_t*>(p);
+        if (!is_code_like_ptr(v_vtable)) continue;
+        uintptr_t cls_raw = *reinterpret_cast<const uintptr_t*>(
+            reinterpret_cast<const uint8_t*>(p) + 0x10);
+        bool cls_loc = ((cls_raw >> 40) == lv_arena) || is_code_like_ptr(cls_raw);
+        if (!cls_loc) continue;
+        if (!is_readable(reinterpret_cast<const void*>(cls_raw), 0x30)) continue;
+        if (!is_code_like_ptr(*reinterpret_cast<const uintptr_t*>(cls_raw))) continue;
+
+        if (multiply_slot_count(v, factor)) ++written;
+    }
+    return written;
+}
+
+// One-shot pass: walk all populated R5LootActors, apply current factor to any
+// not yet processed. Skips empty ones (LootView==null) and CDOs. Returns
+// {actors_seen, actors_processed_now, slots_written}.
+struct LootSweepResult { int seen = 0; int processed = 0; int slots = 0; };
+static LootSweepResult sweep_loot_actors(float factor)
+{
+    LootSweepResult r{};
+    if (factor == 1.0f) return r; // no-op: nothing to multiply
+
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur) return LoopAction::Continue;
+        auto* cls = cur->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5LootActor"))
+            return LoopAction::Continue;
+        auto full = cur->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+        UObject* lv = *reinterpret_cast<UObject**>(
+            reinterpret_cast<uint8_t*>(cur) + 0x310);
+        if (!lv) return LoopAction::Continue;
+
+        ++r.seen;
+        if (g_loot_processed.count(cur)) return LoopAction::Continue;
+
+        int wrote = apply_loot_to_actor(cur, factor);
+        g_loot_processed.insert(cur);
+        if (wrote > 0) {
+            ++r.processed;
+            r.slots += wrote;
+        }
+        return LoopAction::Continue;
+    });
+    return r;
+}
+
+// Set the loot factor and do an immediate sweep. Returns status string.
+static std::string apply_loot_multiplier(float factor)
+{
+    g_loot_factor = factor;
+    if (factor == 1.0f) {
+        // Reset semantics: future spawns get 1x. Existing already-processed
+        // actors keep whatever they had. Clear processed set so a later
+        // factor change can re-process IF user wants. (The processed set is
+        // there to prevent compounding, not to prevent re-processing.)
+        g_loot_processed.clear();
+        return "loot x1.00 saved; new spawns inherit default (no multiplier applied)";
+    }
+    auto r = sweep_loot_actors(factor);
+    char buf[200];
+    std::snprintf(buf, sizeof(buf),
+        "loot x%.2f saved; processed %d/%d existing actors (%d slot counts written)",
+        static_cast<double>(factor), r.processed, r.seen, r.slots);
+    return buf;
+}
+
+// Public re-sweep. Lua's loot-tick calls this every few seconds so newly
+// spawned R5LootActors get caught soon after they appear.
+static std::string loot_tick()
+{
+    if (g_loot_factor == 1.0f) return "loot factor 1.0 — no-op";
+    auto r = sweep_loot_actors(g_loot_factor);
+    if (r.processed == 0 && r.slots == 0) return "loot tick: no new actors";
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+        "loot tick: +%d actor(s), +%d slot(s) at x%.2f",
+        r.processed, r.slots, static_cast<double>(g_loot_factor));
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// XP multiplier
+// Windrose awards XP via quest completion. R5BLQuestParams is a reflected
+// data-asset class with `ExperienceCount: int32` at +0x01A0 (the XP awarded
+// on quest completion). Walk all loaded quest assets and overwrite the
+// reflected field with original*factor — leveling speeds up, which in turn
+// awards attribute/skill-tree points faster (those derive from level).
+// Originals are captured per-asset so factor=1.0 cleanly restores defaults.
+// ---------------------------------------------------------------------------
+
+static std::unordered_map<UObject*, int32_t> g_xp_originals;
+
+static std::string apply_xp_multiplier(float factor)
+{
+    int updated = 0, total = 0;
+    UObjectGlobals::ForEachUObject([&](UObject* obj, int32, int32) {
+        if (!obj) return LoopAction::Continue;
+        auto* cls = obj->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5BLQuestParams"))
+            return LoopAction::Continue;
+        auto full = obj->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+
+        ++total;
+        auto* prop = obj->GetPropertyByNameInChain(STR("ExperienceCount"));
+        if (!prop) return LoopAction::Continue;
+        auto* xp_ptr = prop->ContainerPtrToValuePtr<int32_t>(obj);
+        if (!xp_ptr) return LoopAction::Continue;
+
+        auto it = g_xp_originals.find(obj);
+        if (it == g_xp_originals.end()) {
+            g_xp_originals[obj] = *xp_ptr;
+            it = g_xp_originals.find(obj);
+        }
+        int32_t original = it->second;
+        int32_t newval = static_cast<int32_t>(static_cast<float>(original) * factor + 0.5f);
+        if (original > 0 && newval < 1) newval = 1;
+        if (newval > 1000000) newval = 1000000;
+        if (*xp_ptr != newval) {
+            *xp_ptr = newval;
+            ++updated;
+        }
+        return LoopAction::Continue;
+    });
+
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+        "xp x%.2f saved; rewrote %d/%d quest XP reward(s)",
+        static_cast<double>(factor), updated, total);
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// Stack size multiplier
+// R5BLInventoryItem has an inline FR5BLInventoryItemGPP struct at
+// reflected offset (lookup via property). The struct's first field is
+// MaxCountInSlot: int32 (struct offset 0) — the max stack size for this
+// item. Multiply per-asset, capture originals for clean reset.
+// ---------------------------------------------------------------------------
+
+static std::unordered_map<UObject*, int32_t> g_stack_originals;
+
+static std::string apply_stack_size_multiplier(float factor)
+{
+    int updated = 0, total = 0;
+    UObjectGlobals::ForEachUObject([&](UObject* obj, int32, int32) {
+        if (!obj) return LoopAction::Continue;
+        auto* cls = obj->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5BLInventoryItem"))
+            return LoopAction::Continue;
+        auto full = obj->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+
+        ++total;
+        auto* gpp_prop = obj->GetPropertyByNameInChain(STR("InventoryItemGppData"));
+        if (!gpp_prop) return LoopAction::Continue;
+        // MaxCountInSlot is at struct offset 0 — the first field of
+        // R5BLInventoryItemGPP per ap.classprobe.
+        int32_t* max_count = reinterpret_cast<int32_t*>(
+            reinterpret_cast<uint8_t*>(obj) + gpp_prop->GetOffset_Internal() + 0);
+
+        auto it = g_stack_originals.find(obj);
+        if (it == g_stack_originals.end()) {
+            g_stack_originals[obj] = *max_count;
+            it = g_stack_originals.find(obj);
+        }
+        int32_t original = it->second;
+        if (original <= 0) return LoopAction::Continue; // un-stackable items keep their value
+        int32_t newval = static_cast<int32_t>(static_cast<float>(original) * factor + 0.5f);
+        if (newval < 1) newval = 1;
+        if (newval > 1000000) newval = 1000000;
+        if (*max_count != newval) {
+            *max_count = newval;
+            ++updated;
+        }
+        return LoopAction::Continue;
+    });
+
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+        "stack_size x%.2f saved; rewrote %d/%d item stack limit(s)",
+        static_cast<double>(factor), updated, total);
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// TArray walking helpers — shared by craft_cost / harvest_yield.
+// UE TArray layout in UE5: { T* Data; int32 Num; int32 Max; } = 16 bytes.
+// ---------------------------------------------------------------------------
+
+struct TArrayHeader { void* Data; int32 Num; int32 Max; };
+static_assert(sizeof(TArrayHeader) == 16, "TArray header must be 16 bytes");
+
+// ---------------------------------------------------------------------------
+// Reflection-based TArray walker
+// Resolves the array offset, element size, and field-within-element offsets
+// from FArrayProperty + FStructProperty reflection — no hardcoded layout.
+// Earlier hand-coded offsets caused a server crash on player connect because
+// the assumed 0x60 element stride was wrong for at least one of the arrays;
+// the writes corrupted adjacent in-memory data assets, which the player-
+// verify path then read and tripped on.
+// ---------------------------------------------------------------------------
+
+struct ArrayFieldInfo {
+    bool       valid    = false;
+    uintptr_t  arr_off  = 0;   // offset of the TArray header on the asset
+    size_t     elem_sz  = 0;   // bytes per array element
+    size_t     fld_off1 = 0;   // offset of first int32 field within element
+    size_t     fld_off2 = SIZE_MAX; // optional second int32 field; SIZE_MAX = none
+};
+
+// Look up a TArray<Struct>'s layout via reflection, plus 1 or 2 int32 fields
+// within the element struct.
+static ArrayFieldInfo resolve_int32_field_in_array(
+    UObject* asset,
+    const TCHAR* arr_name,
+    const TCHAR* field1_name,
+    const TCHAR* field2_name = nullptr)
+{
+    ArrayFieldInfo info;
+    auto* arr_prop = asset->GetPropertyByNameInChain(arr_name);
+    if (!arr_prop) return info;
+
+    auto* arr_typed = static_cast<RC::Unreal::FArrayProperty*>(arr_prop);
+    auto* inner = arr_typed->GetInner();
+    if (!inner) return info;
+
+    int32 elem_size = inner->GetElementSize();
+    if (elem_size <= 0 || elem_size > 0x10000) return info;
+
+    auto* struct_inner = static_cast<RC::Unreal::FStructProperty*>(inner);
+    auto* sstruct = struct_inner->GetStruct().Get();
+    if (!sstruct) return info;
+
+    auto* f1 = sstruct->GetPropertyByNameInChain(field1_name);
+    if (!f1) return info;
+    size_t off1 = static_cast<size_t>(f1->GetOffset_Internal());
+    if (off1 + 4 > static_cast<size_t>(elem_size)) return info;
+
+    size_t off2 = SIZE_MAX;
+    if (field2_name) {
+        auto* f2 = sstruct->GetPropertyByNameInChain(field2_name);
+        if (!f2) return info;
+        off2 = static_cast<size_t>(f2->GetOffset_Internal());
+        if (off2 + 4 > static_cast<size_t>(elem_size)) return info;
+    }
+
+    info.valid    = true;
+    info.arr_off  = static_cast<uintptr_t>(arr_prop->GetOffset_Internal());
+    info.elem_sz  = static_cast<size_t>(elem_size);
+    info.fld_off1 = off1;
+    info.fld_off2 = off2;
+    return info;
+}
+
+// ---------------------------------------------------------------------------
+// Craft cost multiplier
+// R5BLRecipeData.RecipeCost: TArray<R5BLItemsStackData> with `Count: int32`.
+// Offsets and element size resolved via reflection (see above).
+// ---------------------------------------------------------------------------
+
+static std::unordered_map<UObject*, std::vector<int32_t>> g_craft_originals;
+
+static std::string apply_craft_cost_multiplier(float factor)
+{
+    int recipes_seen = 0, recipes_updated = 0, elems_written = 0;
+    int skipped_layout = 0, skipped_unreadable = 0;
+
+    UObjectGlobals::ForEachUObject([&](UObject* obj, int32, int32) {
+        if (!obj) return LoopAction::Continue;
+        auto* cls = obj->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5BLRecipeData"))
+            return LoopAction::Continue;
+        auto full = obj->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+
+        ++recipes_seen;
+
+        auto info = resolve_int32_field_in_array(obj, STR("RecipeCost"), STR("Count"));
+        if (!info.valid) { ++skipped_layout; return LoopAction::Continue; }
+
+        auto* hdr = reinterpret_cast<TArrayHeader*>(
+            reinterpret_cast<uint8_t*>(obj) + info.arr_off);
+        if (!hdr->Data || hdr->Num <= 0 || hdr->Num > 100) return LoopAction::Continue;
+
+        size_t span = info.elem_sz * static_cast<size_t>(hdr->Num);
+        if (!is_readable(hdr->Data, span)) { ++skipped_unreadable; return LoopAction::Continue; }
+
+        auto* base = reinterpret_cast<uint8_t*>(hdr->Data);
+
+        auto& orig = g_craft_originals[obj];
+        if (static_cast<int>(orig.size()) != hdr->Num) {
+            orig.clear();
+            orig.reserve(hdr->Num);
+            for (int i = 0; i < hdr->Num; ++i) {
+                int32_t* count = reinterpret_cast<int32_t*>(base + i * info.elem_sz + info.fld_off1);
+                int32_t v = *count;
+                // Sanity: cost counts should be small positive ints. If the
+                // value at our offset looks bogus (huge / negative / zero),
+                // either the reflection lied or the array entry is empty;
+                // store as 0 to skip in the apply pass.
+                if (v < 0 || v > 1000000) v = 0;
+                orig.push_back(v);
+            }
+        }
+
+        bool any = false;
+        for (int i = 0; i < hdr->Num; ++i) {
+            int32_t original = orig[i];
+            if (original <= 0) continue;
+            int32_t* count = reinterpret_cast<int32_t*>(base + i * info.elem_sz + info.fld_off1);
+            int32_t newval = static_cast<int32_t>(static_cast<float>(original) * factor + 0.5f);
+            if (newval < 1) newval = 1;
+            if (newval > 1000000) newval = 1000000;
+            if (*count != newval) {
+                *count = newval;
+                ++elems_written;
+                any = true;
+            }
+        }
+        if (any) ++recipes_updated;
+        return LoopAction::Continue;
+    });
+
+    char buf[200];
+    std::snprintf(buf, sizeof(buf),
+        "craft_cost x%.2f saved; rewrote %d entries across %d/%d recipe(s)%s",
+        static_cast<double>(factor), elems_written, recipes_updated, recipes_seen,
+        (skipped_layout || skipped_unreadable) ? " (some skipped: bad layout/unreadable)" : "");
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// Harvest yield multiplier
+// Walks every loot-data struct variant in the loaded UObject set:
+//   R5BLLootData (in R5BLLootParams.LootData) -- the main loot tables
+//   R5LootData, R5FoliageLootData, FoliageLootData, R5DropLootData,
+//   R5DigVolumeLootData -- used in various other containers
+// Each variant has its own (min, max) field offset within the element struct;
+// element size + array offset are resolved via reflection.
+// A periodic tick (lua_harvest_tick) re-applies the factor every 2s so newly-
+// streamed-in loot tables get caught.
+// ---------------------------------------------------------------------------
+
+struct LootStructLayout { const TCHAR* struct_name; size_t min_off; size_t max_off; };
+static const LootStructLayout kLootStructs[] = {
+    { STR("R5BLLootData"),        0x00, 0x04 },
+    { STR("R5LootData"),          0x28, 0x2C },
+    { STR("R5FoliageLootData"),   0x30, 0x34 },
+    { STR("FoliageLootData"),     0x28, 0x2C },
+    { STR("R5DropLootData"),      0x2C, 0x30 },
+    { STR("R5DigVolumeLootData"), 0x28, 0x2C },
+};
+
+static const LootStructLayout* match_loot_struct(std::wstring_view name)
+{
+    for (const auto& s : kLootStructs) {
+        if (name == std::wstring_view(s.struct_name)) return &s;
+    }
+    return nullptr;
+}
+
+// Originals are keyed by (asset, array_property_offset) so different TArrays
+// on the same asset don't collide.
+struct LootOrigKey {
+    UObject* asset;
+    uint32_t arr_off;
+    bool operator==(const LootOrigKey& o) const {
+        return asset == o.asset && arr_off == o.arr_off;
+    }
+};
+struct LootOrigKeyHash {
+    size_t operator()(const LootOrigKey& k) const {
+        return std::hash<void*>()(k.asset) ^ (static_cast<size_t>(k.arr_off) << 16);
+    }
+};
+static std::unordered_map<LootOrigKey, std::vector<std::pair<int32_t,int32_t>>,
+                         LootOrigKeyHash> g_loot_originals_v2;
+static float g_harvest_factor = 1.0f;
+
+// Apply factor to one TArray on an asset, given the layout. Returns
+// number of elements written.
+static int apply_loot_array(
+    UObject* asset, uint32_t arr_off, size_t elem_size,
+    size_t min_off, size_t max_off, float factor)
+{
+    auto* hdr = reinterpret_cast<TArrayHeader*>(
+        reinterpret_cast<uint8_t*>(asset) + arr_off);
+    if (!hdr->Data || hdr->Num <= 0 || hdr->Num > 10000) return 0;
+
+    size_t span = elem_size * static_cast<size_t>(hdr->Num);
+    if (!is_readable(hdr->Data, span)) return 0;
+
+    auto* base = reinterpret_cast<uint8_t*>(hdr->Data);
+
+    LootOrigKey key{asset, arr_off};
+    auto& orig = g_loot_originals_v2[key];
+    if (static_cast<int>(orig.size()) != hdr->Num) {
+        orig.clear();
+        orig.reserve(hdr->Num);
+        for (int i = 0; i < hdr->Num; ++i) {
+            int32_t* mn = reinterpret_cast<int32_t*>(base + i * elem_size + min_off);
+            int32_t* mx = reinterpret_cast<int32_t*>(base + i * elem_size + max_off);
+            int32_t v_min = *mn, v_max = *mx;
+            if (v_min < 0 || v_min > 1000000) v_min = 0;
+            if (v_max < 0 || v_max > 1000000) v_max = 0;
+            orig.emplace_back(v_min, v_max);
+        }
+    }
+
+    auto multiply = [factor](int32_t v) -> int32_t {
+        if (v <= 0) return v;
+        int32_t n = static_cast<int32_t>(static_cast<float>(v) * factor + 0.5f);
+        if (n < 1) n = 1;
+        if (n > 1000000) n = 1000000;
+        return n;
+    };
+
+    int written = 0;
+    for (int i = 0; i < hdr->Num; ++i) {
+        int32_t orig_min = orig[i].first;
+        int32_t orig_max = orig[i].second;
+        if (orig_min <= 0 && orig_max <= 0) continue;
+        int32_t* mn = reinterpret_cast<int32_t*>(base + i * elem_size + min_off);
+        int32_t* mx = reinterpret_cast<int32_t*>(base + i * elem_size + max_off);
+        int32_t new_min = multiply(orig_min);
+        int32_t new_max = multiply(orig_max);
+        if (*mn != new_min || *mx != new_max) {
+            *mn = new_min;
+            *mx = new_max;
+            ++written;
+        }
+    }
+    return written;
+}
+
+// Sweep all UObjects, find any FArrayProperty whose inner struct matches a
+// known loot-data variant, multiply min/max in each element. Returns
+// {arrays_seen, arrays_written, elems_written, struct_variants_used}.
+struct HarvestSweepResult {
+    int arrays_seen = 0;
+    int arrays_written = 0;
+    int elems_written = 0;
+    int variants_seen = 0; // bitmask over kLootStructs
+};
+static HarvestSweepResult sweep_harvest_yield(float factor)
+{
+    HarvestSweepResult r{};
+    UObjectGlobals::ForEachUObject([&](UObject* obj, int32, int32) {
+        if (!obj) return LoopAction::Continue;
+        auto* cls = obj->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        auto path = obj->GetFullName();
+        if (path.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+
+        for (auto* prop : cls->ForEachPropertyInChain()) {
+            if (!prop) continue;
+            if (!prop->GetClass().HasAnyCastFlags(RC::Unreal::CASTCLASS_FArrayProperty)) continue;
+
+            auto* arr_prop = static_cast<RC::Unreal::FArrayProperty*>(prop);
+            auto* inner = arr_prop->GetInner();
+            if (!inner) continue;
+            if (!inner->GetClass().HasAnyCastFlags(RC::Unreal::CASTCLASS_FStructProperty)) continue;
+
+            auto* struct_inner = static_cast<RC::Unreal::FStructProperty*>(inner);
+            auto* sstruct = struct_inner->GetStruct().Get();
+            if (!sstruct) continue;
+
+            const auto* layout = match_loot_struct(sstruct->GetName());
+            if (!layout) continue;
+
+            int32 elem_size = inner->GetElementSize();
+            if (elem_size <= 0 || elem_size > 0x10000) continue;
+            if (layout->min_off + 4 > static_cast<size_t>(elem_size)) continue;
+            if (layout->max_off + 4 > static_cast<size_t>(elem_size)) continue;
+
+            uint32_t arr_off = static_cast<uint32_t>(arr_prop->GetOffset_Internal());
+            ++r.arrays_seen;
+            int wrote = apply_loot_array(obj, arr_off, static_cast<size_t>(elem_size),
+                                          layout->min_off, layout->max_off, factor);
+            if (wrote > 0) {
+                ++r.arrays_written;
+                r.elems_written += wrote;
+            }
+        }
+        return LoopAction::Continue;
+    });
+    return r;
+}
+
+// Old per-class storage kept for reference; new code uses g_loot_originals_v2.
+static std::unordered_map<UObject*, std::vector<std::pair<int32_t,int32_t>>> g_harvest_originals;
+
+static std::string apply_harvest_yield_multiplier(float factor)
+{
+    g_harvest_factor = factor;
+    auto r = sweep_harvest_yield(factor);
+    char buf[220];
+    std::snprintf(buf, sizeof(buf),
+        "harvest_yield x%.2f saved; rewrote %d entries across %d/%d loot arrays (all variants)",
+        static_cast<double>(factor), r.elems_written, r.arrays_written, r.arrays_seen);
+    return buf;
+}
+
+// Lua tick to catch loot tables that load lazily (e.g., when the player
+// streams into a new region). No-op when factor is 1.0.
+static std::string harvest_yield_tick()
+{
+    if (g_harvest_factor == 1.0f) return "harvest tick: factor 1.0, no-op";
+    auto r = sweep_harvest_yield(g_harvest_factor);
+    if (r.elems_written == 0) return "harvest tick: no new entries";
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+        "harvest tick: +%d entries across +%d arrays at x%.2f",
+        r.elems_written, r.arrays_written, static_cast<double>(g_harvest_factor));
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// Coop scale knob — directly overrides Coop_StatsCorrectionModifier WDS
+// param's DefaultValue. Set to 1.0 to remove the post-roll loot scaling that
+// otherwise reduces drops below what harvest_yield says.
+// R5WDSFloatParams has DefaultValue: float at +0x58 (reflected).
+// ---------------------------------------------------------------------------
+
+static std::unordered_map<UObject*, float> g_coop_originals;
+
+static std::string apply_coop_scale_multiplier(float factor)
+{
+    int updated = 0, found = 0;
+    UObjectGlobals::ForEachUObject([&](UObject* obj, int32, int32) {
+        if (!obj) return LoopAction::Continue;
+        auto* cls = obj->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5WDSFloatParams"))
+            return LoopAction::Continue;
+        auto full = obj->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+        // Filter to the coop-scaling parameter specifically (don't touch
+        // ShipsHealth / MobsDamage / etc.).
+        if (full.find(STR("Coop_StatsCorrectionModifier")) == std::wstring::npos)
+            return LoopAction::Continue;
+
+        ++found;
+        auto* prop = obj->GetPropertyByNameInChain(STR("DefaultValue"));
+        if (!prop) return LoopAction::Continue;
+        auto* val = prop->ContainerPtrToValuePtr<float>(obj);
+        if (!val) return LoopAction::Continue;
+
+        auto it = g_coop_originals.find(obj);
+        if (it == g_coop_originals.end()) {
+            g_coop_originals[obj] = *val;
+            it = g_coop_originals.find(obj);
+        }
+        float original = it->second;
+        // factor here is the desired absolute value (0.5 = half drops, 1.0 = full,
+        // 2.0 = double — direct override of the WDS param).
+        float newval = factor;
+        if (newval < 0.01f) newval = 0.01f;
+        if (newval > 100.0f) newval = 100.0f;
+        if (*val != newval) {
+            *val = newval;
+            ++updated;
+        }
+        (void)original; // captured for future revert; reset uses factor=1.0 directly
+        return LoopAction::Continue;
+    });
+
+    char buf[160];
+    if (found == 0) {
+        std::snprintf(buf, sizeof(buf),
+            "coop_scale x%.2f saved; Coop_StatsCorrectionModifier asset not loaded yet",
+            static_cast<double>(factor));
+    } else {
+        std::snprintf(buf, sizeof(buf),
+            "coop_scale set to %.2f; %d/%d WDS asset(s) updated",
+            static_cast<double>(factor), updated, found);
+    }
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// Crop speed multiplier
+// R5BLCropParams.GrowthDuration is an FTimespan (single int64 Ticks at +0x00
+// of the struct). factor > 1.0 = faster growth = SHORTER duration, so we
+// write `original / factor`.
+// ---------------------------------------------------------------------------
+
+static std::unordered_map<UObject*, int64_t> g_crop_originals;
+
+static std::string apply_crop_speed_multiplier(float factor)
+{
+    int updated = 0, total = 0;
+    if (factor < 0.01f) factor = 0.01f;
+    UObjectGlobals::ForEachUObject([&](UObject* obj, int32, int32) {
+        if (!obj) return LoopAction::Continue;
+        auto* cls = obj->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5BLCropParams"))
+            return LoopAction::Continue;
+        auto full = obj->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+
+        ++total;
+        auto* prop = obj->GetPropertyByNameInChain(STR("GrowthDuration"));
+        if (!prop) return LoopAction::Continue;
+        // FTimespan: { int64 Ticks } at struct offset 0
+        int64_t* ticks = reinterpret_cast<int64_t*>(
+            reinterpret_cast<uint8_t*>(obj) + prop->GetOffset_Internal());
+
+        auto it = g_crop_originals.find(obj);
+        if (it == g_crop_originals.end()) {
+            g_crop_originals[obj] = *ticks;
+            it = g_crop_originals.find(obj);
+        }
+        int64_t original = it->second;
+        if (original <= 0) return LoopAction::Continue;
+
+        // factor > 1 = faster growth = SHORTER duration -> divide
+        int64_t newval = static_cast<int64_t>(
+            static_cast<double>(original) / static_cast<double>(factor) + 0.5);
+        if (newval < 1) newval = 1;
+        if (*ticks != newval) {
+            *ticks = newval;
+            ++updated;
+        }
+        return LoopAction::Continue;
+    });
+
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+        "crop_speed x%.2f saved; rewrote growth duration on %d/%d crop(s)",
+        static_cast<double>(factor), updated, total);
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// Points-per-level multiplier
+// R5BLEntityProgressionLevelParams.Levels: TArray<R5BLEntityProgressionLevelInfo>.
+// Each element has TalentPointsReward (skill tree points) at +0x14 and
+// StatPointsReward (attribute points) at +0x18 — the points awarded to the
+// player when they reach that level. Multiply both for "more points per
+// level".
+// ---------------------------------------------------------------------------
+
+static std::unordered_map<UObject*, std::vector<std::pair<int32_t,int32_t>>> g_points_originals;
+
+static std::string apply_points_per_level_multiplier(float factor)
+{
+    int total_assets = 0, updated_assets = 0, elems_written = 0;
+    UObjectGlobals::ForEachUObject([&](UObject* obj, int32, int32) {
+        if (!obj) return LoopAction::Continue;
+        auto* cls = obj->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5BLEntityProgressionLevelParams"))
+            return LoopAction::Continue;
+        auto full = obj->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+
+        ++total_assets;
+        auto info = resolve_int32_field_in_array(obj, STR("Levels"),
+            STR("TalentPointsReward"), STR("StatPointsReward"));
+        if (!info.valid) return LoopAction::Continue;
+
+        auto* hdr = reinterpret_cast<TArrayHeader*>(
+            reinterpret_cast<uint8_t*>(obj) + info.arr_off);
+        if (!hdr->Data || hdr->Num <= 0 || hdr->Num > 1000) return LoopAction::Continue;
+
+        size_t span = info.elem_sz * static_cast<size_t>(hdr->Num);
+        if (!is_readable(hdr->Data, span)) return LoopAction::Continue;
+
+        auto* base = reinterpret_cast<uint8_t*>(hdr->Data);
+
+        auto& orig = g_points_originals[obj];
+        if (static_cast<int>(orig.size()) != hdr->Num) {
+            orig.clear();
+            orig.reserve(hdr->Num);
+            for (int i = 0; i < hdr->Num; ++i) {
+                int32_t* talent = reinterpret_cast<int32_t*>(base + i * info.elem_sz + info.fld_off1);
+                int32_t* stat   = reinterpret_cast<int32_t*>(base + i * info.elem_sz + info.fld_off2);
+                int32_t v_talent = *talent, v_stat = *stat;
+                if (v_talent < 0 || v_talent > 1000000) v_talent = 0;
+                if (v_stat   < 0 || v_stat   > 1000000) v_stat   = 0;
+                orig.emplace_back(v_talent, v_stat);
+            }
+        }
+
+        auto multiply = [factor](int32_t v) -> int32_t {
+            if (v <= 0) return v;
+            int32_t n = static_cast<int32_t>(static_cast<float>(v) * factor + 0.5f);
+            if (n < 1) n = 1;
+            if (n > 1000000) n = 1000000;
+            return n;
+        };
+
+        bool any = false;
+        for (int i = 0; i < hdr->Num; ++i) {
+            int32_t orig_talent = orig[i].first;
+            int32_t orig_stat = orig[i].second;
+            int32_t* talent = reinterpret_cast<int32_t*>(base + i * info.elem_sz + info.fld_off1);
+            int32_t* stat   = reinterpret_cast<int32_t*>(base + i * info.elem_sz + info.fld_off2);
+            int32_t new_talent = multiply(orig_talent);
+            int32_t new_stat = multiply(orig_stat);
+            if (*talent != new_talent || *stat != new_stat) {
+                *talent = new_talent;
+                *stat = new_stat;
+                ++elems_written;
+                any = true;
+            }
+        }
+        if (any) ++updated_assets;
+        return LoopAction::Continue;
+    });
+
+    char buf[200];
+    std::snprintf(buf, sizeof(buf),
+        "points_per_level x%.2f saved; rewrote %d entries across %d/%d level table(s)",
+        static_cast<double>(factor), elems_written, updated_assets, total_assets);
+    return buf;
+}
+
+// ap_native_applyworldmult(key, value) -> status string.
+// Dispatches to the per-multiplier impl. Unknown / unwired keys return a
+// "saved; not yet wired" message.
+static int lua_applyworldmult(const LuaMadeSimple::Lua& lua)
+{
+    if (!lua.is_string()) {
+        lua.set_string("usage: ap_native_applyworldmult(key, value)");
+        return 1;
+    }
+    std::string key{lua.get_string()};
+    if (!lua.is_number()) {
+        lua.set_string("value must be a number");
+        return 1;
+    }
+    float val = lua.get_float();
+    if (!(val >= 0.0f) || val > 1000.0f) {
+        lua.set_string("value out of range");
+        return 1;
+    }
+
+    if (key == "weight") {
+        lua.set_string(apply_weight_multiplier(val));
+        return 1;
+    }
+    if (key == "loot") {
+        lua.set_string(apply_loot_multiplier(val));
+        return 1;
+    }
+    if (key == "xp") {
+        lua.set_string(apply_xp_multiplier(val));
+        return 1;
+    }
+    if (key == "stack_size") {
+        lua.set_string(apply_stack_size_multiplier(val));
+        return 1;
+    }
+    if (key == "craft_cost") {
+        lua.set_string(apply_craft_cost_multiplier(val));
+        return 1;
+    }
+    if (key == "harvest_yield") {
+        lua.set_string(apply_harvest_yield_multiplier(val));
+        return 1;
+    }
+    if (key == "coop_scale") {
+        lua.set_string(apply_coop_scale_multiplier(val));
+        return 1;
+    }
+    if (key == "crop_speed") {
+        lua.set_string(apply_crop_speed_multiplier(val));
+        return 1;
+    }
+    if (key == "points_per_level") {
+        lua.set_string(apply_points_per_level_multiplier(val));
+        return 1;
+    }
+
+    char buf[120];
+    std::snprintf(buf, sizeof(buf),
+        "%s = %.3f saved; native impl not yet wired", key.c_str(), static_cast<double>(val));
+    lua.set_string(std::string(buf));
+    return 1;
+}
+
+// ap_native_loot_tick() -> status string. Re-sweeps R5LootActors so new
+// spawns inherit the current loot factor. Called periodically by the Lua
+// mod (no-op if factor is 1.0).
+static int lua_loot_tick(const LuaMadeSimple::Lua& lua)
+{
+    lua.set_string(loot_tick());
+    return 1;
+}
+
+// ap_native_harvest_tick() -> status string. Re-sweeps loot tables to catch
+// any that streamed in after the last setmult call. No-op if factor is 1.0.
+static int lua_harvest_tick(const LuaMadeSimple::Lua& lua)
+{
+    lua.set_string(harvest_yield_tick());
     return 1;
 }
 
@@ -2442,10 +3407,10 @@ public:
     AdmiralsPanelNative() : CppUserModBase()
     {
         ModName = STR("AdmiralsPanel-Native");
-        ModVersion = STR("0.6.0");
+        ModVersion = STR("0.7.0");
         ModDescription = STR("Native UFunction bridge + standalone HTTP server for AdmiralsPanel");
         ModAuthors = STR("Mancavegaming");
-        Output::send<LogLevel::Verbose>(STR("[AdmiralsPanel-Native] loaded (v0.6.0)\n"));
+        Output::send<LogLevel::Verbose>(STR("[AdmiralsPanel-Native] loaded (v0.7.0)\n"));
 
         // v0.6 standalone mode: load config, start our own HTTP server +
         // session + spool bridge. Running alongside WindrosePlus on port
@@ -2488,6 +3453,9 @@ public:
         lua.register_function("admiralspanel_native_revive",  lua_revive);
         lua.register_function("admiralspanel_native_setattr", lua_setattr);
         lua.register_function("admiralspanel_native_readattr",lua_readattr);
+        lua.register_function("admiralspanel_native_applyworldmult", lua_applyworldmult);
+        lua.register_function("admiralspanel_native_loot_tick", lua_loot_tick);
+        lua.register_function("admiralspanel_native_harvest_tick", lua_harvest_tick);
         lua.register_function("admiralspanel_native_allstats",lua_allstats);
         lua.register_function("admiralspanel_native_classprobe",lua_classprobe);
         lua.register_function("admiralspanel_native_scan",     lua_scan);

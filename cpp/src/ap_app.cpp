@@ -12,11 +12,23 @@
 #include <thread>
 #include <vector>
 
+// Exposed by ap_status_source.cpp — cheap, safe, off-spool gatherers that
+// read values directly from the running game state. Lives in the global
+// ::ap_status namespace (not nested inside ap_app).
+namespace ap_status {
+    int         count_player_controllers();
+    std::string read_config_server_name();
+    std::string read_exe_file_version();
+    std::string read_invite_code();
+    int         read_max_players();
+    uint64_t    process_uptime_seconds();
+}
+
 namespace ap_app {
 
 namespace {
 
-constexpr std::chrono::minutes kSessionLifetime{60 * 24};
+constexpr std::chrono::minutes kSessionLifetime{60 * 24 * 30}; // 30 days
 
 std::string gen_hex_token(size_t bytes = 16)
 {
@@ -108,6 +120,36 @@ const char* kLoginHtml = R"HTML(<!doctype html>
 </body></html>
 )HTML";
 
+// Extract the raw `"multipliers": {...}` JSON object substring from
+// admiralspanel.json on each /api/status hit. Re-reading the file each call
+// is cheap (<1KB) and avoids stale cache vs the Lua mod's writes.
+// Returns "{}" on any failure or absence.
+std::string read_multipliers_json(const std::string& cfg_path)
+{
+    std::ifstream f(cfg_path, std::ios::binary);
+    if (!f) return "{}";
+    std::ostringstream o;
+    o << f.rdbuf();
+    std::string j = o.str();
+
+    size_t k = j.find("\"multipliers\"");
+    if (k == std::string::npos) return "{}";
+    size_t colon = j.find(':', k);
+    if (colon == std::string::npos) return "{}";
+    size_t open = j.find('{', colon);
+    if (open == std::string::npos) return "{}";
+
+    int depth = 0;
+    for (size_t p = open; p < j.size(); ++p) {
+        if (j[p] == '{') ++depth;
+        else if (j[p] == '}') {
+            --depth;
+            if (depth == 0) return j.substr(open, p - open + 1);
+        }
+    }
+    return "{}";
+}
+
 const char* kIndexFallback = R"HTML(<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -151,7 +193,7 @@ bool App::start()
     });
     m_http.route("/healthcheck", [](const ap_http::Request&) {
         return ap_http::json_response(200,
-            R"({"status":"ok","app":"AdmiralsPanel","version":"0.6.0"})");
+            R"({"status":"ok","app":"AdmiralsPanel","version":"0.7.0"})");
     });
 
     // Root + static files.
@@ -204,6 +246,12 @@ std::string App::extract_cookie(const ap_http::Request& r, const std::string& na
 
 bool App::is_authenticated(const ap_http::Request& r) const
 {
+    // Localhost-trust: requests from 127.0.0.1 / ::1 bypass auth. The HTTP
+    // server binds all interfaces, but external access is gated by the
+    // host + cloud firewalls. On the machine itself, we assume the admin
+    // and don't force login. Remove this block to revert to strict auth.
+    if (r.client_ip == "127.0.0.1" || r.client_ip == "::1") return true;
+
     auto cookie = extract_cookie(r, "ap_session");
     if (cookie.empty()) return false;
     std::lock_guard<std::mutex> lk(m_sess_mu);
@@ -243,7 +291,7 @@ ap_http::Response App::handle_login_post(const ap_http::Request& r)
     auto resp = ap_http::redirect_response("/");
     resp.extra_headers.push_back({
         "Set-Cookie",
-        "ap_session=" + tok + "; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax"
+        "ap_session=" + tok + "; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax"
     });
     return resp;
 }
@@ -290,21 +338,46 @@ ap_http::Response App::handle_health(const ap_http::Request& r)
 {
     if (!is_authenticated(r)) return ap_http::json_response(401, R"({"error":"auth"})");
     return ap_http::json_response(200,
-        R"({"status":"ok","version":"0.6.0","ts":")" + iso8601_ms_now() + "\"}");
+        R"({"status":"ok","version":"0.7.0","ts":")" + iso8601_ms_now() + "\"}");
 }
 
 ap_http::Response App::handle_status(const ap_http::Request& r)
 {
     if (!is_authenticated(r)) return ap_http::json_response(401, R"({"error":"auth"})");
     const auto& cfg = ap_cfg::get();
+
+    int      players      = ap_status::count_player_controllers();
+    int      max_players  = ap_status::read_max_players();
+    std::string server_name = ap_status::read_config_server_name();
+    std::string game_ver    = ap_status::read_exe_file_version();
+    std::string invite      = ap_status::read_invite_code();
+    uint64_t uptime         = ap_status::process_uptime_seconds();
+
+    std::filesystem::path cfg_path =
+        std::filesystem::path(cfg.game_dir) / "admiralspanel.json";
+    std::string mults = read_multipliers_json(cfg_path.string());
+
     std::ostringstream o;
     o << "{";
-    o << "\"version\":\"0.6.0\",";
-    o << "\"http_port\":" << cfg.http_port << ",";
-    o << "\"game_dir\":\""  << json_escape(cfg.game_dir)  << "\",";
-    o << "\"data_dir\":\""  << json_escape(cfg.data_dir)  << "\",";
-    o << "\"web_dir\":\""   << json_escape(cfg.web_dir)   << "\",";
-    o << "\"spool_dir\":\"" << json_escape(cfg.spool_dir) << "\"";
+    o << "\"server\":{";
+    o <<   "\"name\":\""            << json_escape(server_name) << "\",";
+    o <<   "\"version\":\""         << json_escape(game_ver)    << "\",";
+    o <<   "\"admiralspanel\":\"0.7.0\",";
+    o <<   "\"windrose_plus\":null,"; // kept for panel backwards-compat
+    o <<   "\"invite_code\":"       << (invite.empty() ? std::string("null") :
+                                         ("\"" + json_escape(invite) + "\"")) << ",";
+    o <<   "\"player_count\":" << players << ",";
+    o <<   "\"max_players\":"  << max_players << ",";
+    o <<   "\"uptime_seconds\":" << uptime;
+    o << "},";
+    o << "\"multipliers\":" << mults << ",";
+    o << "\"meta\":{";
+    o <<   "\"http_port\":" << cfg.http_port << ",";
+    o <<   "\"game_dir\":\""  << json_escape(cfg.game_dir)  << "\",";
+    o <<   "\"data_dir\":\""  << json_escape(cfg.data_dir)  << "\",";
+    o <<   "\"web_dir\":\""   << json_escape(cfg.web_dir)   << "\",";
+    o <<   "\"spool_dir\":\"" << json_escape(cfg.spool_dir) << "\"";
+    o << "}";
     o << "}";
     return ap_http::json_response(200, o.str());
 }

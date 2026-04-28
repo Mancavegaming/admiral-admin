@@ -14,18 +14,19 @@ const ADMIN_LOG_POLL_MS = 15000;
 const SPEED_DEBOUNCE_MS = 500;
 const MULT_DEBOUNCE_MS = 500;
 
-// Must match mod/init.lua MULTIPLIERS.
+// Must match mod/init.lua MULTIPLIERS keys + impl status.
+//   impl = "unwired"   -> persisted, no live effect (stub)
+//   impl = "native"    -> applied via AdmiralsPanelNative.dll
 const MULTIPLIERS = [
-    { key: "loot",            label: "Loot",               desc: "Drop multiplier", min: 0,    max: 10, step: 0.1 },
-    { key: "xp",              label: "XP",                 desc: "Experience multiplier", min: 0, max: 10, step: 0.1 },
-    { key: "weight",          label: "Weight",             desc: "Carry weight multiplier", min: 0.1, max: 5, step: 0.1 },
-    { key: "craft_cost",      label: "Craft cost",         desc: "Crafting cost multiplier", min: 0.1, max: 5, step: 0.1 },
-    { key: "stack_size",      label: "Stack size",         desc: "Inventory stack size", min: 0.5, max: 10, step: 0.5 },
-    { key: "crop_speed",      label: "Crop speed",         desc: "Crop growth multiplier", min: 0.1, max: 10, step: 0.1 },
-    { key: "cooking_speed",   label: "Cooking speed",      desc: "Cooking speed multiplier", min: 0.1, max: 10, step: 0.1 },
-    { key: "inventory_size",  label: "Inventory size",     desc: "Inventory size multiplier", min: 0.5, max: 5, step: 0.5 },
-    { key: "points_per_level",label: "Points / level",     desc: "Skill points per level multiplier", min: 0.5, max: 5, step: 0.5 },
-    { key: "harvest_yield",   label: "Harvest yield",      desc: "Harvest yield multiplier", min: 0.1, max: 10, step: 0.1 },
+    { key: "loot",            label: "Loot",               desc: "Drop multiplier (applies on next pickup of newly-spawned loot; effective max ~4x due to in-game post-roll cap)", min: 0.1, max: 4, step: 0.1, impl: "native" },
+    { key: "xp",              label: "XP",                 desc: "XP per quest completion (also scales attribute & skill-tree points via faster leveling)", min: 0.1, max: 10, step: 0.1, impl: "native" },
+    { key: "weight",          label: "Weight",             desc: "Carry weight multiplier (live for online players; new connects re-apply)", min: 0.1, max: 5, step: 0.1, impl: "native" },
+    { key: "craft_cost",      label: "Craft cost",         desc: "Resource cost per recipe (set <1 for cheaper crafting)", min: 0.1, max: 5, step: 0.1, impl: "native" },
+    { key: "stack_size",      label: "Stack size",         desc: "Per-item max stack size (applies to all loaded item assets)", min: 0.5, max: 10, step: 0.5, impl: "native" },
+    { key: "crop_speed",      label: "Crop speed",         desc: "Crop growth speed (>1 = faster; multiplies all R5BLCropParams growth durations)", min: 0.1, max: 10, step: 0.1, impl: "native" },
+    { key: "points_per_level",label: "Points / level",     desc: "Talent + stat points awarded per level-up (separate from xp)", min: 0.5, max: 5, step: 0.5, impl: "native" },
+    { key: "harvest_yield",   label: "Harvest yield",      desc: "Drop counts on every loot table (foliage, mobs, chests); effective max ~4x due to in-game post-roll cap", min: 0.1, max: 4, step: 0.1, impl: "native" },
+    { key: "coop_scale",      label: "Coop scale",         desc: "Direct override of Coop_StatsCorrectionModifier (1.0 = no scaling, removes the cap that throttles harvest_yield)", min: 0.1, max: 10, step: 0.1, impl: "native" },
 ];
 
 // Known R5AttributeSet fields (from ap.inspectn dump). Grouped for UX.
@@ -91,12 +92,13 @@ const ATTRIBUTE_GROUPS = [
 
 // Must match mod/data/presets.json.
 const PRESETS = [
-    { id: "vanilla",     label: "Vanilla",       tag: "Full reset", desc: "All multipliers at 1.0 — Windrose defaults." },
-    { id: "easy",        label: "Easy",          tag: "Full",       desc: "More loot / XP, lighter gear, bigger stacks." },
-    { id: "hard",        label: "Hard",          tag: "Full",       desc: "Grindy / punishing — scarcer loot, heavier carry." },
-    { id: "event-2xxp",  label: "Event: 2× XP",  tag: "Partial",    desc: "Weekend event — double XP only." },
-    { id: "event-loot",  label: "Event: 2× Loot",tag: "Partial",    desc: "Weekend event — double loot only." },
-    { id: "event-chill", label: "Event: Chill",  tag: "Partial",    desc: "Relaxed build — half craft cost, bigger stacks, faster cooking." },
+    { id: "vanilla",      label: "Vanilla",        tag: "Full reset", desc: "All multipliers at 1.0 — Windrose defaults." },
+    { id: "easy",         label: "Easy",           tag: "Full",       desc: "More loot / XP, lighter gear, bigger stacks, faster crops." },
+    { id: "hard",         label: "Hard",           tag: "Full",       desc: "Grindy / punishing — scarcer loot, heavier carry, costlier crafting." },
+    { id: "event-2xxp",   label: "Event: 2× XP",   tag: "Partial",    desc: "Weekend event — double XP only." },
+    { id: "event-loot",   label: "Event: 2× Loot", tag: "Partial",    desc: "Double loot drops + harvest yield." },
+    { id: "event-chill",  label: "Event: Chill",   tag: "Partial",    desc: "Relaxed build — half craft cost & weight, bigger stacks, fast crops." },
+    { id: "event-points", label: "Event: 3× Points", tag: "Partial",  desc: "Skill tree event — triple talent + stat points per level-up." },
 ];
 
 // ---------------------------------------------------------------------------
@@ -171,6 +173,17 @@ async function pollStatus() {
         if (!status) return;
         state.status = status;
         state.lastPollOk = Date.now();
+
+        // /api/status doesn't include the players array (positions, last_death).
+        // Fold in ap.players so the per-player UI has data to render.
+        try {
+            const r = await rcon("ap.players");
+            if (r && r.status === "ok" && r.message) {
+                const arr = JSON.parse(r.message);
+                if (Array.isArray(arr)) state.status.players = arr;
+            }
+        } catch (_) { /* tolerate transient parse/rcon failures */ }
+
         renderTopbar();
         renderActiveTab();
         setStatusDot("dot-live");
@@ -314,7 +327,9 @@ function renderPlayers() {
     empty.classList.add("hidden");
     table.classList.remove("hidden");
 
-    const key = players.map(p => p.name).sort().join(",");
+    // Include last_death presence so the row re-renders (and the
+    // TP→Death button enables) when a death is first recorded.
+    const key = players.map(p => `${p.name}:${p.last_death ? "1" : "0"}`).sort().join(",");
     const needsRebuild = key !== state.playersKey;
 
     if (needsRebuild) {
@@ -352,6 +367,11 @@ function renderPlayers() {
                         <button class="row-btn row-btn-feed"   data-feed="${esc(p.name)}">Feed</button>
                         <button class="row-btn row-btn-revive" data-revive="${esc(p.name)}">Revive</button>
                         <button class="row-btn row-btn-kill"   data-kill="${esc(p.name)}">Kill</button>
+                        <button class="row-btn" data-tpdeath="${esc(p.name)}"
+                                ${p.last_death ? "" : "disabled"}
+                                title="${p.last_death
+                                    ? `Teleport to last death (${Math.round(p.last_death.x)}, ${Math.round(p.last_death.y)}, ${Math.round(p.last_death.z)})`
+                                    : 'No death recorded yet'}">TP→Death</button>
                     </div>
                 </td>
                 <td>
@@ -405,6 +425,13 @@ function renderPlayers() {
         b.addEventListener("click", () => {
             if (!confirm(`Kill ${b.dataset.kill}?`)) return;
             runNative(`ap.killn ${b.dataset.kill}`, `Kill ${b.dataset.kill}`, b);
+        });
+    });
+
+    tbody.querySelectorAll("button[data-tpdeath]").forEach(b => {
+        b.addEventListener("click", () => {
+            const name = b.dataset.tpdeath;
+            runNative(`ap.tplastdeath ${name}`, `TP ${name} → death`, b);
         });
     });
 
@@ -478,9 +505,12 @@ function buildWorld() {
     for (const m of MULTIPLIERS) {
         const card = document.createElement("div");
         card.className = "mult-card";
+        const badge = m.impl === "native"
+            ? '<span class="mult-badge mult-badge-live" title="Applies live via AdmiralsPanelNative.dll">live</span>'
+            : '<span class="mult-badge mult-badge-stub" title="Persisted only — no in-game effect yet (RE pending)">unwired</span>';
         card.innerHTML = `
             <div class="mult-header">
-                <span class="mult-title">${esc(m.label)}</span>
+                <span class="mult-title">${esc(m.label)} ${badge}</span>
                 <span class="mult-value" id="mv-${m.key}">1.0×</span>
             </div>
             <input type="range" min="${m.min}" max="${m.max}" step="${m.step}" value="1"
@@ -687,7 +717,7 @@ async function renderServer() {
     if (s) {
         setText("srv-name", s.name || "-");
         setText("srv-gameversion", s.version || "-");
-        setText("srv-wpversion", s.windrose_plus || "-");
+        setText("srv-apversion", s.admiralspanel || s.windrose_plus || "-");
         setText("srv-invite", s.invite_code || "-");
         setText("srv-players", `${s.player_count || 0}${s.max_players ? "/" + s.max_players : ""}`);
         setText("srv-uptime", serverUptime());

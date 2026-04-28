@@ -393,12 +393,23 @@ void Server::handle_connection(uintptr_t client_socket)
 {
     SOCKET sock = static_cast<SOCKET>(client_socket);
 
+    // Resolve the peer IP for localhost-trust.
+    Request req;
+    {
+        sockaddr_in peer{};
+        int pn = sizeof(peer);
+        if (getpeername(sock, reinterpret_cast<sockaddr*>(&peer), &pn) == 0) {
+            char ip[INET_ADDRSTRLEN] = {};
+            inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+            req.client_ip = ip;
+        }
+    }
+
     // Read request line.
     std::string line;
     if (!read_until(sock, "\r\n", line, 4096)) { closesocket(sock); return; }
     line.resize(line.size() - 2);
 
-    Request req;
     if (!parse_request_line(line, req)) {
         write_response(sock, text_response(400, "bad request line"));
         closesocket(sock);

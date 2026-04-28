@@ -21,7 +21,7 @@
     <div class="flex items-center gap-3">
         <span class="text-2xl">⚓</span>
         <h1 class="text-xl font-bold tracking-wide text-gold">AdmiralsPanel</h1>
-        <span class="text-xs text-cream/50" id="app-version">v0.1.0</span>
+        <span class="text-xs text-cream/50" id="app-version">v0.7.0</span>
     </div>
     <div class="flex items-center gap-4 text-sm">
         <span id="status-dot" class="w-2 h-2 rounded-full bg-gold/60" title="polling"></span>
@@ -78,9 +78,15 @@
         <!-- World multipliers -->
         <section id="tab-world" class="tab-panel hidden">
             <h2 class="tab-heading">World multipliers</h2>
-            <p class="text-sm text-cream/60 mb-4">
-                Applies live where the engine supports it; always persists to <code>windrose_plus.json</code>.
-                Some multipliers may require a server restart to take effect.
+            <p class="text-sm text-cream/60 mb-2">
+                Values persist to <code>admiralspanel.json</code>. Each card shows whether
+                its multiplier is wired to live game state.
+            </p>
+            <p class="text-xs text-cream/50 mb-4">
+                <span class="mult-badge mult-badge-live">live</span> applies via native hook immediately.
+                <span class="mult-badge mult-badge-stub">unwired</span> only saves; Windrose has no built-in
+                multiplier property for that key, so a native interception is needed before it does anything in-game.
+                Implementation is being added per multiplier.
             </p>
             <div id="multipliers-grid" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
         </section>
@@ -175,8 +181,8 @@
                     <div id="srv-gameversion" class="info-value">-</div>
                 </div>
                 <div class="info-card">
-                    <div class="info-label">WindrosePlus</div>
-                    <div id="srv-wpversion" class="info-value">-</div>
+                    <div class="info-label">AdmiralsPanel</div>
+                    <div id="srv-apversion" class="info-value">-</div>
                 </div>
                 <div class="info-card">
                     <div class="info-label">Invite Code</div>

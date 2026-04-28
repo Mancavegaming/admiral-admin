@@ -41,14 +41,19 @@ jobs:
           body: |
             AdmiralsPanel ${{ github.ref_name }}
 
-            ## Install
+            ## Install (standalone, default — no WindrosePlus needed)
 
-            ```powershell
-            # Download and extract admiral-admin-${{ steps.version.outputs.version }}.zip,
-            # then from inside the extracted folder:
-            powershell -ExecutionPolicy Bypass -File install.ps1
-            ```
+            1. Download `admiral-admin-${{ steps.version.outputs.version }}.zip` and `main.dll` from the assets below.
+            2. Extract the zip somewhere on the server.
+            3. Drop `main.dll` at `cpp/dist/main.dll` inside the extracted folder.
+            4. From the extracted folder:
 
-            See [README.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md) for full setup.
+               ```powershell
+               powershell -ExecutionPolicy Bypass -File install.ps1
+               ```
 
-            **Requires [WindrosePlus](https://github.com/HumanGenome/WindrosePlus) v1.0.7+ installed first.**
+            5. Restart the server and open <http://localhost:8790/>.
+
+            **Requires [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS/releases/latest)** installed at `R5/Binaries/Win64/ue4ss/`. The installer fails with a friendly link if it's missing.
+
+            See [README.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md) and [docs/install.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/install.md) for full setup, troubleshooting, and the legacy WindrosePlus sub-mod option.

@@ -33,19 +33,31 @@ do
 end
 
 local MOD_NAME = "AdmiralsPanel"
-local VERSION  = "0.6.0"
+local VERSION  = "0.7.0"
 
 -- ---------------------------------------------------------------------------
 -- Paths
 -- ---------------------------------------------------------------------------
 
+-- Cache the resolved game dir — io.popen("cd") spawns a visible cmd window
+-- on Windows, so we must NOT call it on every hot path.
+local _cached_game_dir = nil
+local _cached_game_dir_resolved = false
+
 local function gameDir()
+    if _cached_game_dir_resolved then return _cached_game_dir end
+    _cached_game_dir_resolved = true
+
     if Config then
         local ok, p = pcall(function() return Config._path end)
-        if ok and p then return p:match("^(.*)[\\/][^\\/]+$") end
+        if ok and p then
+            _cached_game_dir = p:match("^(.*)[\\/][^\\/]+$")
+            return _cached_game_dir
+        end
     end
     -- Standalone: UE4SS cwd is <game>\R5\Binaries\Win64. Walk up 3 levels
-    -- to reach the game root.
+    -- to reach the game root. io.popen("cd") is called exactly ONCE
+    -- (startup) thanks to the module-level cache above.
     local ok, c = pcall(function()
         local f = io.popen("cd")
         if not f then return nil end
@@ -58,6 +70,7 @@ local function gameDir()
         local parent = c:match("^(.+)[\\/][^\\/]+$")
         if parent and parent ~= "" then c = parent end
     end
+    _cached_game_dir = c
     return c
 end
 
@@ -165,40 +178,46 @@ end
 -- Multipliers (pure Lua)
 -- ---------------------------------------------------------------------------
 
+-- Each multiplier ships with an `impl` field tracking what's wired:
+--   "unwired"  - persisted to JSON, no live game effect.
+--   "native"   - applied via AdmiralsPanelNative.dll's applyworldmult dispatch.
+-- The previous code wrote to gm[XPMultiplier] etc. on R5GameMode which has no
+-- such property. UE4SS's pcall accepts the write silently, so the result
+-- always SAID "(live: XPMultiplier)" but nothing actually happened. We're
+-- replacing that lie with honest reporting and per-key native impls.
 local MULTIPLIERS = {
-    loot             = { desc = "Loot drop multiplier",         ue = {"LootMultiplier"} },
-    xp               = { desc = "XP / experience multiplier",   ue = {"XPMultiplier", "ExperienceMultiplier"} },
-    weight           = { desc = "Carry weight multiplier",      ue = {"WeightMultiplier"} },
-    craft_cost       = { desc = "Crafting cost multiplier",     ue = {"CraftCostMultiplier"} },
-    stack_size       = { desc = "Inventory stack size mult.",   ue = {"StackSizeMultiplier"} },
-    crop_speed       = { desc = "Crop growth speed multiplier", ue = {"CropGrowthMultiplier", "CropSpeedMultiplier"} },
-    cooking_speed    = { desc = "Cooking speed multiplier",     ue = {"CookingSpeedMultiplier", "CookingSpeed"} },
-    inventory_size   = { desc = "Inventory size multiplier",    ue = {"InventorySizeMultiplier"} },
-    points_per_level = { desc = "Skill points per level mult.", ue = {"PointsPerLevelMultiplier"} },
-    harvest_yield    = { desc = "Harvest yield multiplier",     ue = {"HarvestMultiplier", "HarvestYieldMultiplier"} },
+    loot             = { desc = "Loot drop multiplier",         impl = "native"  },
+    xp               = { desc = "XP / experience multiplier",   impl = "native"  },
+    weight           = { desc = "Carry weight multiplier",      impl = "native"  },
+    craft_cost       = { desc = "Crafting cost multiplier",     impl = "native"  },
+    stack_size       = { desc = "Inventory stack size mult.",   impl = "native"  },
+    crop_speed       = { desc = "Crop growth speed multiplier", impl = "native"  },
+    points_per_level = { desc = "Skill points per level mult.", impl = "native"  },
+    harvest_yield    = { desc = "Harvest yield multiplier",     impl = "native"  },
+    coop_scale       = { desc = "Coop drop-scale override",     impl = "native"  },
 }
 
 local function validMultiplierValue(v)
     return type(v) == "number" and v >= 0 and v < 1000
 end
 
+-- Returns a status string describing whether the value took effect live or is
+-- just persisted. Native dispatch lands per-multiplier as RE work catches up.
+-- We look up the native function directly (not via nativeAvailable, which is
+-- declared later in the file) to avoid a forward-reference issue.
 local function applyMultiplierToGame(key, value)
     local spec = MULTIPLIERS[key]
-    if not spec then return {} end
-    local applied = {}
-    local gms = FindAllOf("R5GameMode")
-    if not gms then return applied end
-    for _, gm in ipairs(gms) do
-        if gm:IsValid() then
-            for _, prop in ipairs(spec.ue) do
-                pcall(function()
-                    gm[prop] = value
-                    table.insert(applied, prop)
-                end)
-            end
+    if not spec then return "saved" end
+    if spec.impl == "native" then
+        local fn = _G["admiralspanel_native_applyworldmult"]
+        if type(fn) ~= "function" then
+            return "saved; native DLL missing (install AdmiralsPanelNative.dll)"
         end
+        local ok, result = pcall(fn, key, value)
+        if not ok then return "saved; native call failed: " .. tostring(result) end
+        return tostring(result)
     end
-    return applied
+    return "saved; not yet wired (no in-game effect)"
 end
 
 local function persistMultiplier(key, value)
@@ -252,15 +271,12 @@ local function applyPreset(name)
     for key, value in pairs(p.multipliers) do
         if MULTIPLIERS[key] and validMultiplierValue(value) then
             local okPersist, persistErr = persistMultiplier(key, value)
-            local applied = applyMultiplierToGame(key, value)
             if okPersist then
                 anyApplied = true
-                local liveMarker = #applied > 0
-                    and (" (live: " .. table.concat(applied, ",") .. ")")
-                    or  " (saved; applies on restart)"
-                table.insert(lines, string.format("  %s = %s%s", key, tostring(value), liveMarker))
+                local status = applyMultiplierToGame(key, value)
+                table.insert(lines, string.format("  %s = %s  (%s)", key, tostring(value), status))
             else
-                table.insert(lines, string.format("  %s = %s — FAILED: %s", key, tostring(value), persistErr or "?"))
+                table.insert(lines, string.format("  %s = %s -- FAILED: %s", key, tostring(value), persistErr or "?"))
             end
         else
             table.insert(lines, "  skipped '" .. key .. "' (unknown key or bad value)")
@@ -332,6 +348,145 @@ local function nativeAvailable(fn_name)
 end
 
 -- ---------------------------------------------------------------------------
+-- Death watch — poll HP each tick, snapshot last alive pos, persist last
+-- death location per player to admiralspanel_data\death_locations.json so
+-- the panel can offer a "TP to last death" button.
+-- ---------------------------------------------------------------------------
+
+local function deathFile()
+    local dd = dataDir()
+    if not dd then return nil end
+    return dd .. "\\death_locations.json"
+end
+
+local function readDeaths()
+    local p = deathFile()
+    if not p then return {} end
+    local t = readJson(p)
+    return type(t) == "table" and t or {}
+end
+
+local function recordDeath(name, x, y, z)
+    local p = deathFile()
+    if not p then return end
+    local t = readDeaths()
+    t[name] = { x = x, y = y, z = z, t = os.time() }
+    pcall(writeJson, p, t)
+end
+
+-- Per-player {hp, x, y, z} from the last tick. Lost on restart, which is
+-- fine — death_locations.json is the persistent record.
+local _deathwatch = { hp = {}, pos = {} }
+
+local function readAllStatsJson()
+    local has, fn = nativeAvailable("admiralspanel_native_allstats")
+    if not (has and json) then return nil end
+    local ok, msg = pcall(fn)
+    if not ok or type(msg) ~= "string" then return nil end
+    local ok2, data = pcall(json.decode, msg)
+    if not ok2 then return nil end
+    return data
+end
+
+local function deathwatchTick()
+    local stats = readAllStatsJson()
+    if not stats then return end
+    local players = listPlayers()
+    for _, p in ipairs(players) do
+        local s = stats[p.name]
+        if type(s) == "table" then
+            local hp = tonumber(s.Health) or 0
+            local x, y, z = readPos(p.pawn)
+            if hp > 0 and x then
+                _deathwatch.pos[p.name] = { x = x, y = y, z = z, t = os.time() }
+            end
+            local prev = _deathwatch.hp[p.name]
+            if prev and prev > 0 and hp <= 0 then
+                local last = _deathwatch.pos[p.name]
+                if last then
+                    recordDeath(p.name, last.x, last.y, last.z)
+                    log("info", string.format("Death: %s @ (%.0f, %.0f, %.0f)",
+                        p.name, last.x, last.y, last.z))
+                end
+            end
+            _deathwatch.hp[p.name] = hp
+        end
+    end
+end
+
+if not _G._AP_DEATHWATCH_STARTED and type(LoopAsync) == "function" then
+    _G._AP_DEATHWATCH_STARTED = true
+    LoopAsync(1000, function()
+        local ok, err = pcall(deathwatchTick)
+        if not ok then log("error", "deathwatch tick failed: " .. tostring(err)) end
+        return false
+    end)
+    log("info", "Death watch started (1s poll)")
+end
+
+-- Loot-multiplier tick. Applies the current loot factor to any newly-spawned
+-- R5LootActor every 2s. Native side stores the factor + a processed-set so
+-- this is a cheap walk that no-ops when factor=1.0 or no new actors appeared.
+if not _G._AP_LOOTMULT_STARTED and type(LoopAsync) == "function" then
+    _G._AP_LOOTMULT_STARTED = true
+    LoopAsync(2000, function()
+        local fn = _G["admiralspanel_native_loot_tick"]
+        if type(fn) == "function" then pcall(fn) end
+        return false
+    end)
+    log("info", "Loot multiplier tick started (2s poll)")
+end
+
+-- Harvest-yield tick. Re-applies the configured multiplier to all loot
+-- tables every 2s, catching tables that load lazily as regions stream in.
+if not _G._AP_HARVEST_TICK_STARTED and type(LoopAsync) == "function" then
+    _G._AP_HARVEST_TICK_STARTED = true
+    LoopAsync(2000, function()
+        local fn = _G["admiralspanel_native_harvest_tick"]
+        if type(fn) == "function" then pcall(fn) end
+        return false
+    end)
+    log("info", "Harvest yield tick started (2s poll)")
+end
+
+-- Startup re-apply: after a server restart, the DLL's in-memory factor
+-- defaults to 1.0 even though the JSON still has the user's chosen value.
+-- Push each native-impl multiplier through once so the DLL state matches
+-- what the user persisted. Defers a few seconds to let the native module
+-- finish registering its functions.
+if not _G._AP_MULT_REAPPLY_QUEUED and type(LoopAsync) == "function" then
+    _G._AP_MULT_REAPPLY_QUEUED = true
+    local _reapply_done = false
+    LoopAsync(3000, function()
+        if _reapply_done then return false end
+        local cfg = nil
+        local path
+        if Config and Config._path then path = Config._path
+        else
+            local gd = gameDir()
+            if gd then path = gd .. "\\admiralspanel.json" end
+        end
+        if path then cfg = readJson(path) end
+        if not cfg or type(cfg.multipliers) ~= "table" then
+            _reapply_done = true
+            return false
+        end
+        for key, value in pairs(cfg.multipliers) do
+            local spec = MULTIPLIERS[key]
+            if spec and spec.impl == "native" and validMultiplierValue(value) then
+                local fn = _G["admiralspanel_native_applyworldmult"]
+                if type(fn) == "function" then
+                    pcall(fn, key, value)
+                    log("info", string.format("Re-applied %s = %s on startup", key, tostring(value)))
+                end
+            end
+        end
+        _reapply_done = true
+        return false
+    end)
+end
+
+-- ---------------------------------------------------------------------------
 -- Commands
 -- ---------------------------------------------------------------------------
 
@@ -348,14 +503,12 @@ API.registerCommand("ap.setmult", function(args)
     if not validMultiplierValue(value) then return "Invalid value (0..999): " .. tostring(args[2]) end
 
     local okPersist, persistErr = persistMultiplier(key, value)
-    local applied = applyMultiplierToGame(key, value)
     local result
     if not okPersist then
         result = "Persist failed: " .. (persistErr or "?")
-    elseif #applied == 0 then
-        result = string.format("%s = %s  (saved; applies on restart)", key, tostring(value))
     else
-        result = string.format("%s = %s  (live: %s)", key, tostring(value), table.concat(applied, ", "))
+        local status = applyMultiplierToGame(key, value)
+        result = string.format("%s = %s  (%s)", key, tostring(value), status)
     end
     appendAdminLog("ap.setmult", args, result)
     return result
@@ -445,7 +598,50 @@ API.registerCommand("ap.tpxyz", function(args)
     return "Teleport failed: " .. tostring(err)
 end, "Teleport player to coordinates", "ap.tpxyz <player> <x> <y> <z>")
 
+API.registerCommand("ap.tplastdeath", function(args)
+    if #args < 1 then return "Usage: ap.tplastdeath <player>" end
+    local p = findPlayerByName(args[1])
+    if not p then return "Player '" .. args[1] .. "' not found" end
+    local entry = readDeaths()[p.name]
+    if not entry then return "No recorded death for " .. p.name end
+    local ok, err = teleportTo(p.pawn, entry.x, entry.y, entry.z)
+    if not ok then return "Teleport failed: " .. tostring(err) end
+    local result = string.format("Teleported %s -> last death (%.0f, %.0f, %.0f)",
+        p.name, entry.x, entry.y, entry.z)
+    appendAdminLog("ap.tplastdeath", args, result)
+    return result
+end, "Teleport a player to their last recorded death location",
+   "ap.tplastdeath <player>")
+
+-- Players list with positions + last_death. Returns JSON string for the web
+-- UI to populate state.status.players.
+API.registerCommand("ap.players", function()
+    if not json then return "[]" end
+    local deaths = readDeaths()
+    local out = {}
+    for _, p in ipairs(listPlayers()) do
+        local x, y, z = readPos(p.pawn)
+        local row = { name = p.name }
+        if x then row.x = x; row.y = y; row.z = z end
+        local d = deaths[p.name]
+        if d then row.last_death = d end
+        out[#out+1] = row
+    end
+    local ok, encoded = pcall(json.encode, out)
+    return ok and encoded or "[]"
+end, "JSON list of online players with positions and last death", "ap.players")
+
 -- NATIVE-BACKED commands (require AdmiralsPanelNative.dll)
+-- Commands we exclude from the admin log because they are fired repeatedly
+-- by the web panel's auto-polling (every few seconds) and swamp the log.
+local NOLOG_COMMANDS = {
+    ["ap.allstatsn"] = true,
+    ["ap.adminlog"]  = true,
+    ["ap.lootitems"] = true,
+    ["ap.lootlistn"] = true,
+    ["ap.itemlist"]  = true,
+}
+
 local function nativeWrapper(native_fn_name, usage_fmt, logcmd)
     return function(args)
         local has, fn = nativeAvailable(native_fn_name)
@@ -454,7 +650,9 @@ local function nativeWrapper(native_fn_name, usage_fmt, logcmd)
         end
         local ok, result = pcall(fn, table.unpack(args))
         if not ok then return "Call failed: " .. tostring(result) end
-        appendAdminLog(logcmd, args, tostring(result))
+        if not NOLOG_COMMANDS[logcmd] then
+            appendAdminLog(logcmd, args, tostring(result))
+        end
         return tostring(result)
     end
 end
