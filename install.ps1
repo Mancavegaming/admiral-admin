@@ -3,11 +3,20 @@
 #   powershell -ExecutionPolicy Bypass -File install.ps1            (standalone, default)
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -WithWindrosePlus
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -GameDir "C:\path"
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -SkipSidecar
 #
 # Default (standalone, v0.6+): installs under UE4SS Mods\AdmiralsPanel and
 # Mods\AdmiralsPanelNative. Native DLL runs its own HTTP server on port 8790
 # and handles login / web-panel serving / RCON dispatch. No WindrosePlus
 # required.
+#
+# v0.8 standalone install ALSO sets up the spawn-item sidecar:
+#   - Detects Python (3.11+) on PATH
+#   - Installs Python deps: rocksdict, pymongo
+#   - Copies tools\spawn-item\ into admiralspanel_data\tools\spawn-item\
+#   - Registers Scheduled Task "AdmiralsPanel-Spawn-Sidecar" (At Startup +
+#     At LogOn, restart on failure) and starts it immediately
+# Pass -SkipSidecar to skip this and manage the sidecar yourself.
 #
 # -WithWindrosePlus: legacy sub-mod install for users who still want to run
 # alongside WindrosePlus. Drops into WindrosePlus\Mods\admiral-admin\ and
@@ -15,7 +24,8 @@
 
 param(
     [string]$GameDir = "",
-    [switch]$WithWindrosePlus
+    [switch]$WithWindrosePlus,
+    [switch]$SkipSidecar       # Skip spawn-item sidecar Scheduled Task setup (advanced)
 )
 
 $ErrorActionPreference = "Stop"
@@ -78,7 +88,9 @@ if (-not (Test-Path -LiteralPath $ue4ssMods)) {
 # ===========================================================================
 if (-not $WithWindrosePlus) {
 
-    Write-Step "1/4" "Installing standalone Lua mod..."
+    $totalSteps = if ($SkipSidecar) { 4 } else { 5 }
+
+    Write-Step "1/$totalSteps" "Installing standalone Lua mod..."
 
     $modSrc = Join-Path $repoRoot "mod"
     if (-not (Test-Path -LiteralPath $modSrc)) {
@@ -108,7 +120,7 @@ if (-not $WithWindrosePlus) {
         Write-Info "Both modes run in parallel - remove the sub-mod if you no longer use WindrosePlus."
     }
 
-    Write-Step "2/4" "Installing web panel..."
+    Write-Step "2/$totalSteps" "Installing web panel..."
 
     $webSrc = Join-Path $repoRoot "web"
     $webDst = Join-Path $GameDir "admiralspanel_data\web"
@@ -120,7 +132,7 @@ if (-not $WithWindrosePlus) {
         Write-Warn "web\ folder not found - skipping UI install"
     }
 
-    Write-Step "3/4" "Installing native DLL..."
+    Write-Step "3/$totalSteps" "Installing native DLL..."
 
     $nativeDll = Join-Path $repoRoot "cpp\dist\main.dll"
     $nativeDir = Join-Path $ue4ssMods "AdmiralsPanelNative"
@@ -149,7 +161,80 @@ if (-not $WithWindrosePlus) {
     }
     if (-not $alreadyN) { Add-Content -Path $modsTxt -Value "AdmiralsPanelNative : 1" }
 
-    Write-Step "4/4" "Done."
+    # ---- Step 4: Spawn-item tool + sidecar (optional) -----------------------
+    if (-not $SkipSidecar) {
+        Write-Step "4/$totalSteps" "Installing spawn-item tool + sidecar..."
+
+        # Find Python (3.11+ recommended).
+        $pythonCmd = $null
+        foreach ($candidate in @("python", "python3", "py")) {
+            $p = Get-Command $candidate -ErrorAction SilentlyContinue
+            if ($p) { $pythonCmd = $p.Source; break }
+        }
+        if (-not $pythonCmd) {
+            Write-Warn "Python not found in PATH — spawn-item tool will not be installed."
+            Write-Host "      Install Python 3.11+ from https://www.python.org/downloads/" -ForegroundColor Yellow
+            Write-Host "      then re-run install.ps1 (or run with -SkipSidecar to skip this step)." -ForegroundColor Yellow
+        } else {
+            $pyVersion = & $pythonCmd --version 2>&1
+            Write-Info "Python: $pyVersion ($pythonCmd)"
+
+            # Install Python deps. Capture output so we don't spam unless something errored.
+            Write-Info "Installing Python deps (rocksdict, pymongo)..."
+            $pipOut = & $pythonCmd -m pip install --upgrade --quiet rocksdict pymongo 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warn "pip install failed:"
+                $pipOut | ForEach-Object { Write-Host "        $_" -ForegroundColor DarkGray }
+                Write-Host "      You can retry manually:" -ForegroundColor Yellow
+                Write-Host "        $pythonCmd -m pip install rocksdict pymongo" -ForegroundColor Yellow
+            } else {
+                Write-OK "Python deps installed (rocksdict, pymongo)"
+            }
+
+            # Copy tools/spawn-item to admiralspanel_data/tools/spawn-item.
+            $toolsSrc = Join-Path $repoRoot "tools\spawn-item"
+            $toolsDst = Join-Path $GameDir "admiralspanel_data\tools\spawn-item"
+            if (Test-Path -LiteralPath $toolsSrc) {
+                New-Item -ItemType Directory -Path $toolsDst -Force | Out-Null
+                Copy-Item (Join-Path $toolsSrc "*.py") $toolsDst -Force
+                if (Test-Path -LiteralPath (Join-Path $toolsSrc "README.md")) {
+                    Copy-Item (Join-Path $toolsSrc "README.md") $toolsDst -Force
+                }
+                Write-OK "Spawn tools deployed to $toolsDst"
+            } else {
+                Write-Warn "tools\spawn-item\ not found in repo - sidecar source missing"
+            }
+
+            # Register Scheduled Task for the sidecar.
+            $taskName = "AdmiralsPanel-Spawn-Sidecar"
+            $sidecarPy = Join-Path $toolsDst "sidecar.py"
+            if (-not (Test-Path -LiteralPath $sidecarPy)) {
+                Write-Warn "sidecar.py not at $sidecarPy — skipping Scheduled Task."
+            } else {
+                try {
+                    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                    $action = New-ScheduledTaskAction -Execute $pythonCmd -Argument "`"$sidecarPy`""
+                    $trigger1 = New-ScheduledTaskTrigger -AtStartup
+                    $trigger2 = New-ScheduledTaskTrigger -AtLogOn
+                    $settings = New-ScheduledTaskSettingsSet -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Days 0)
+                    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Highest
+                    Register-ScheduledTask -TaskName $taskName `
+                        -Action $action -Trigger @($trigger1, $trigger2) `
+                        -Settings $settings -Principal $principal `
+                        -Description "Watches admiralspanel_data\rcon\spawn for spawn requests, modifies world RocksDB, restarts game server. Auto-installed by AdmiralsPanel install.ps1." `
+                        | Out-Null
+                    Start-ScheduledTask -TaskName $taskName
+                    Write-OK "Scheduled Task '$taskName' registered + started"
+                } catch {
+                    Write-Warn "Could not register Scheduled Task: $($_.Exception.Message)"
+                    Write-Host "      You can run the sidecar manually as a fallback:" -ForegroundColor Yellow
+                    Write-Host "        $pythonCmd `"$sidecarPy`"" -ForegroundColor Yellow
+                }
+            }
+        }
+    }
+
+    Write-Step "$totalSteps/$totalSteps" "Done."
 
     # --- Pick the right server start script depending on what's installed ---
     $startWp = Join-Path $GameDir "StartWindrosePlusServer.bat"
@@ -172,9 +257,20 @@ if (-not $WithWindrosePlus) {
     Write-Host "    3. Open http://localhost:8790/ in a browser on the server" -ForegroundColor White
     Write-Host "       (or from another machine once the firewall allows port 8790)." -ForegroundColor White
     Write-Host "    4. Log in with the password from admiralspanel.json." -ForegroundColor White
+    if (-not $SkipSidecar) {
+        Write-Host "    5. The 'Spawn' tab in the panel can write items into chests" -ForegroundColor White
+        Write-Host "       (server briefly restarts each spawn ~10s). Sidecar runs as" -ForegroundColor White
+        Write-Host "       Scheduled Task 'AdmiralsPanel-Spawn-Sidecar'." -ForegroundColor White
+    }
     Write-Host ""
     Write-Host "  Verify (after the server is up, ~30s):" -ForegroundColor Cyan
     Write-Host "    curl http://localhost:8790/healthcheck" -ForegroundColor Gray
+    Write-Host "    # expect: {`"status`":`"ok`",`"app`":`"AdmiralsPanel`",`"version`":`"0.8.0`"}" -ForegroundColor Gray
+    if (-not $SkipSidecar) {
+        Write-Host ""
+        Write-Host "  Sidecar status:" -ForegroundColor Cyan
+        Write-Host "    Get-ScheduledTask AdmiralsPanel-Spawn-Sidecar | Get-ScheduledTaskInfo" -ForegroundColor Gray
+    }
     Write-Host ""
     exit 0
 }

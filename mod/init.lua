@@ -33,7 +33,7 @@ do
 end
 
 local MOD_NAME = "AdmiralsPanel"
-local VERSION  = "0.7.0"
+local VERSION  = "0.8.0"
 
 -- ---------------------------------------------------------------------------
 -- Paths
@@ -681,8 +681,11 @@ API.registerCommand("ap.lootinspectn",nativeWrapper("admiralspanel_native_lootin
 API.registerCommand("ap.lootitems",nativeWrapper("admiralspanel_native_lootitems",nil,"ap.lootitems"),"List populated R5LootActors with their item contents","ap.lootitems [N]")
 API.registerCommand("ap.giveitem",nativeWrapper("admiralspanel_native_giveitem",nil,"ap.giveitem"),"Teleport a loot actor containing a matching item to the player","ap.giveitem <player> <search>")
 API.registerCommand("ap.itemlist",nativeWrapper("admiralspanel_native_itemlist",nil,"ap.itemlist"),"List known UR5BLInventoryItem data assets (optionally filtered)","ap.itemlist [search]")
+API.registerCommand("ap.itemcatalog",nativeWrapper("admiralspanel_native_itemcatalog",nil,"ap.itemcatalog"),"JSON array of all 1268 items with name+path (used by Spawn UI)","ap.itemcatalog")
 API.registerCommand("ap.itemscan",nativeWrapper("admiralspanel_native_itemscan",nil,"ap.itemscan"),"Scan an object's memory for UR5BLInventoryItem references","ap.itemscan <target> [bytes]")
 API.registerCommand("ap.lootslots",nativeWrapper("admiralspanel_native_lootslots",nil,"ap.lootslots"),"Hex-dump slot structs of first populated R5LootActor (RE diagnostic)","ap.lootslots [N]")
+API.registerCommand("ap.dumpinv",  nativeWrapper("admiralspanel_native_dumpinv",  nil, "ap.dumpinv"),  "Dump server-side inventory hierarchy state for a player (recon)","ap.dumpinv <player>")
+API.registerCommand("ap.overwriteinv",nativeWrapper("admiralspanel_native_overwriteinv",nil,"ap.overwriteinv"),"Test: overwrite an asset path substring in player inventory memory","ap.overwriteinv <player> [from] [to]")
 API.registerCommand("ap.findn",   nativeWrapper("admiralspanel_native_find",   nil, "ap.findn"),   "Debug: find pawn by name",    "ap.findn <player>")
 API.registerCommand("ap.inspectn",nativeWrapper("admiralspanel_native_inspect",nil, "ap.inspectn"),"Debug: dump object properties","ap.inspectn <player>")
 

@@ -23,6 +23,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -GameDir "D:\SteamLibrary\s
 2. **UE4SS** installed at `R5\Binaries\Win64\ue4ss\`. Latest release: <https://github.com/UE4SS-RE/RE-UE4SS/releases/latest>. Extract the contents of the release zip into `R5\Binaries\Win64\`. The installer fails with a friendly message and a link if UE4SS is missing.
 3. **The native DLL** at `cpp\dist\main.dll` inside the cloned repo. Two ways to get it — see "Native DLL" below.
 4. **PowerShell 5.1+** (ships with Windows Server 2019/2022/2025). The installer file is strict ASCII so PS 5.1's UTF-8-without-BOM quirk does not bite.
+5. **Python 3.11+** (for the v0.8 Spawn feature). <https://www.python.org/downloads/> — tick "Add Python to PATH" during install. The installer detects Python, runs `pip install rocksdict pymongo`, and registers a Scheduled Task for the spawn sidecar. If Python is missing the installer warns and skips — the rest of the panel still works. To opt out explicitly, pass `-SkipSidecar` to `install.ps1`.
 
 ## What gets installed where (standalone)
 
@@ -32,6 +33,8 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -GameDir "D:\SteamLibrary\s
 | `cpp\dist\main.dll` | `R5\Binaries\Win64\ue4ss\Mods\AdmiralsPanelNative\dlls\main.dll` | Native HTTP server + GAS / loot bridges. |
 | (writes) | `R5\Binaries\Win64\ue4ss\Mods\mods.txt` | Adds `AdmiralsPanelNative : 1` if absent. |
 | `web\*` | `admiralspanel_data\web\` | Static web UI files served by the native DLL. |
+| `tools\spawn-item\*.py` | `admiralspanel_data\tools\spawn-item\` | Spawn-feature CLI + sidecar (v0.8+). |
+| (Scheduled Task) | `AdmiralsPanel-Spawn-Sidecar` | Auto-runs `sidecar.py` at boot + logon. |
 | (generated on first server start) | `admiralspanel.json` (server root) | Login password + multiplier persistence. |
 
 ## Native DLL
@@ -52,7 +55,7 @@ After running `install.ps1`, restart the server and wait ~30 seconds for the wor
 
 ```powershell
 curl http://localhost:8790/healthcheck
-# expect: {"status":"ok","app":"AdmiralsPanel","version":"0.7.0"}
+# expect: {"status":"ok","app":"AdmiralsPanel","version":"0.8.0"}
 ```
 
 If you get `Unable to connect`, check in this order:

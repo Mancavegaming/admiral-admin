@@ -21,7 +21,7 @@
     <div class="flex items-center gap-3">
         <span class="text-2xl">⚓</span>
         <h1 class="text-xl font-bold tracking-wide text-gold">AdmiralsPanel</h1>
-        <span class="text-xs text-cream/50" id="app-version">v0.7.0</span>
+        <span class="text-xs text-cream/50" id="app-version">v0.8.0</span>
     </div>
     <div class="flex items-center gap-4 text-sm">
         <span id="status-dot" class="w-2 h-2 rounded-full bg-gold/60" title="polling"></span>
@@ -42,6 +42,7 @@
         <button data-tab="attrs" class="tab-btn">Attributes</button>
         <button data-tab="announce" class="tab-btn">Announce</button>
         <button data-tab="server" class="tab-btn">Server</button>
+        <button data-tab="spawn" class="tab-btn">Spawn</button>
         <button data-tab="console" class="tab-btn">Console</button>
         <div class="mt-8 px-4 text-xs text-cream/40">
             <a href="/" class="underline hover:text-gold">&larr; Back to WP dashboard</a>
@@ -199,6 +200,89 @@
             </div>
             <h3 class="mt-8 mb-2 text-cream/70 text-sm uppercase tracking-wider">Recent admin actions</h3>
             <div id="adminlog-list" class="text-sm font-mono bg-ink-light border border-gold/20 rounded p-3 max-h-64 overflow-y-auto whitespace-pre-wrap"></div>
+        </section>
+
+        <!-- Spawn item -->
+        <section id="tab-spawn" class="tab-panel hidden">
+            <h2 class="tab-heading">Spawn item</h2>
+            <p class="text-sm text-cream/60 mb-4">
+                Inserts an item into a chest's inventory by writing the world RocksDB save.
+                <span class="text-red-400 font-semibold">Warning:</span> stops + restarts the server (~10s downtime).
+                Connected players get disconnected. Admin-only — requires login.
+            </p>
+
+            <form id="spawn-form" class="space-y-4 max-w-2xl">
+
+                <!-- Target chest -->
+                <div class="info-card">
+                    <div class="info-label mb-2">Target chest</div>
+                    <label class="flex items-center gap-2 mb-2 text-sm">
+                        <input type="radio" name="chest-mode" value="key" checked>
+                        <span>By BuildingBlock key (32-char hex)</span>
+                    </label>
+                    <label class="flex items-center gap-2 mb-3 text-sm">
+                        <input type="radio" name="chest-mode" value="marker">
+                        <span>By marker item (chest's slot 0 contains substring)</span>
+                    </label>
+                    <input type="text" id="spawn-chest" placeholder="e.g. A19BDE2BCE1847084BB948AC1B79646A"
+                           class="w-full bg-ink-light border border-gold/30 rounded px-3 py-2 font-mono focus:outline-none focus:border-gold">
+                    <div id="spawn-marker-slot-row" class="mt-2 hidden">
+                        <label class="text-xs text-cream/50">Marker slot index (default 0)</label>
+                        <input type="number" id="spawn-marker-slot" value="0" min="0" max="15"
+                               class="w-20 bg-ink-light border border-gold/30 rounded px-2 py-1 ml-2 font-mono">
+                    </div>
+                </div>
+
+                <!-- Item -->
+                <div class="info-card">
+                    <div class="flex items-center justify-between mb-2">
+                        <div class="info-label">Item</div>
+                        <div class="text-xs text-cream/50">
+                            <span id="item-catalog-count">catalog not loaded</span>
+                            <button type="button" id="item-catalog-refresh" class="ml-2 underline text-gold/70 hover:text-gold">refresh</button>
+                        </div>
+                    </div>
+                    <p class="text-xs text-cream/60 mb-2">
+                        Type any part of an item name — autocomplete shows matches from all 1268 items.
+                        Select an exact match for full-path resolution; otherwise the sidecar searches by substring.
+                    </p>
+                    <input type="text" id="spawn-item"
+                           list="item-catalog"
+                           autocomplete="off"
+                           placeholder="e.g. Wood_T01, Healing_T01, Greatsword_Reliable…"
+                           class="w-full bg-ink-light border border-gold/30 rounded px-3 py-2 font-mono focus:outline-none focus:border-gold">
+                    <datalist id="item-catalog"></datalist>
+                    <div id="spawn-item-resolved" class="text-xs text-cream/50 mt-1 font-mono"></div>
+                </div>
+
+                <!-- Count -->
+                <div class="info-card">
+                    <div class="info-label mb-2">Count</div>
+                    <input type="number" id="spawn-count" value="1" min="1" max="9999"
+                           class="w-32 bg-ink-light border border-gold/30 rounded px-3 py-2 font-mono focus:outline-none focus:border-gold">
+                </div>
+
+                <div class="flex items-center gap-3">
+                    <button type="submit" id="spawn-submit" class="btn-primary">Spawn</button>
+                    <span id="spawn-warning" class="text-sm text-red-300"></span>
+                </div>
+            </form>
+
+            <!-- Live status -->
+            <div id="spawn-status" class="mt-6 hidden">
+                <h3 class="text-cream/70 text-sm uppercase tracking-wider mb-2">Spawn progress</h3>
+                <div id="spawn-status-card" class="info-card font-mono text-sm">
+                    <div class="info-label">id: <span id="spawn-status-id">-</span></div>
+                    <div class="mt-2 text-cream">
+                        <span id="spawn-status-text" class="text-gold">queued</span>
+                    </div>
+                    <pre id="spawn-status-detail" class="mt-2 text-xs text-cream/60 whitespace-pre-wrap"></pre>
+                </div>
+            </div>
+
+            <!-- Recent spawns -->
+            <h3 class="mt-8 mb-2 text-cream/70 text-sm uppercase tracking-wider">Recent spawns (this session)</h3>
+            <div id="spawn-history" class="text-sm font-mono bg-ink-light border border-gold/20 rounded p-3 max-h-64 overflow-y-auto whitespace-pre-wrap"></div>
         </section>
 
         <!-- Console -->
