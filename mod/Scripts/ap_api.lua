@@ -5,7 +5,7 @@
 
 local API = {}
 
-API.VERSION = "0.7.0"
+API.VERSION = "0.8.0"
 
 -- log(level, source, msg) — write to stdout / UE4SS log.
 function API.log(level, source, msg)

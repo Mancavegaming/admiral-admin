@@ -173,6 +173,9 @@ bool App::start()
 {
     const auto& cfg = ap_cfg::get();
 
+    // Restore sessions persisted across server restarts.
+    load_sessions();
+
     // Auth-required routes first.
     m_http.route("/api/health", [this](const ap_http::Request& r) {
         return handle_health(r);
@@ -182,6 +185,12 @@ bool App::start()
     });
     m_http.route("/api/rcon", [this](const ap_http::Request& r) {
         return handle_rcon(r);
+    });
+    m_http.route("/api/spawn", [this](const ap_http::Request& r) {
+        return handle_spawn_post(r);
+    });
+    m_http.route("/api/spawn-status", [this](const ap_http::Request& r) {
+        return handle_spawn_status(r);
     });
 
     m_http.route("/login", [this](const ap_http::Request& r) {
@@ -193,7 +202,7 @@ bool App::start()
     });
     m_http.route("/healthcheck", [](const ap_http::Request&) {
         return ap_http::json_response(200,
-            R"({"status":"ok","app":"AdmiralsPanel","version":"0.7.0"})");
+            R"({"status":"ok","app":"AdmiralsPanel","version":"0.8.0"})");
     });
 
     // Root + static files.
@@ -216,8 +225,69 @@ std::string App::new_session_token()
 {
     std::string tok = gen_hex_token();
     std::lock_guard<std::mutex> lk(m_sess_mu);
-    m_sessions[tok] = std::chrono::steady_clock::now();
+    m_sessions[tok] = std::chrono::system_clock::now();
+    save_sessions();
     return tok;
+}
+
+void App::load_sessions()
+{
+    const auto& cfg = ap_cfg::get();
+    std::filesystem::path path = std::filesystem::path(cfg.data_dir) / "sessions.json";
+    if (!std::filesystem::exists(path)) return;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return;
+    std::string body((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    // Naive JSON object parser: {"token1": <ms>, "token2": <ms>, ...}
+    std::lock_guard<std::mutex> lk(m_sess_mu);
+    auto now = std::chrono::system_clock::now();
+    size_t i = 0;
+    while (i < body.size()) {
+        // Find next quoted token
+        size_t q1 = body.find('"', i);
+        if (q1 == std::string::npos) break;
+        size_t q2 = body.find('"', q1 + 1);
+        if (q2 == std::string::npos) break;
+        std::string tok = body.substr(q1 + 1, q2 - q1 - 1);
+        // Skip ':'
+        size_t colon = body.find(':', q2);
+        if (colon == std::string::npos) break;
+        size_t p = colon + 1;
+        while (p < body.size() && std::isspace(static_cast<unsigned char>(body[p]))) ++p;
+        char* end = nullptr;
+        long long ms = std::strtoll(body.c_str() + p, &end, 10);
+        if (end == body.c_str() + p) break;
+        auto tp = std::chrono::system_clock::time_point(std::chrono::milliseconds(ms));
+        if (now - tp < kSessionLifetime) {
+            m_sessions[tok] = tp;
+        }
+        i = static_cast<size_t>(end - body.c_str());
+    }
+}
+
+void App::save_sessions() const
+{
+    // Caller holds m_sess_mu.
+    const auto& cfg = ap_cfg::get();
+    std::filesystem::path dir(cfg.data_dir);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::filesystem::path path = dir / "sessions.json";
+    std::filesystem::path tmp  = dir / "sessions.json.tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        f << "{";
+        bool first = true;
+        for (const auto& [tok, tp] : m_sessions) {
+            if (!first) f << ",";
+            first = false;
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                tp.time_since_epoch()).count();
+            f << "\"" << json_escape(tok) << "\":" << ms;
+        }
+        f << "}";
+    }
+    std::filesystem::rename(tmp, path, ec);
 }
 
 std::string App::extract_cookie(const ap_http::Request& r, const std::string& name)
@@ -257,7 +327,20 @@ bool App::is_authenticated(const ap_http::Request& r) const
     std::lock_guard<std::mutex> lk(m_sess_mu);
     auto it = m_sessions.find(cookie);
     if (it == m_sessions.end()) return false;
-    auto age = std::chrono::steady_clock::now() - it->second;
+    auto age = std::chrono::system_clock::now() - it->second;
+    return age < kSessionLifetime;
+}
+
+bool App::is_authenticated_strict(const ap_http::Request& r) const
+{
+    // No localhost bypass. Used for high-privilege actions (spawn-item)
+    // where even local processes must present a valid session token.
+    auto cookie = extract_cookie(r, "ap_session");
+    if (cookie.empty()) return false;
+    std::lock_guard<std::mutex> lk(m_sess_mu);
+    auto it = m_sessions.find(cookie);
+    if (it == m_sessions.end()) return false;
+    auto age = std::chrono::system_clock::now() - it->second;
     return age < kSessionLifetime;
 }
 
@@ -302,6 +385,7 @@ ap_http::Response App::handle_logout(const ap_http::Request& r)
     if (!cookie.empty()) {
         std::lock_guard<std::mutex> lk(m_sess_mu);
         m_sessions.erase(cookie);
+        save_sessions();
     }
     auto resp = ap_http::redirect_response("/login");
     resp.extra_headers.push_back({
@@ -338,7 +422,7 @@ ap_http::Response App::handle_health(const ap_http::Request& r)
 {
     if (!is_authenticated(r)) return ap_http::json_response(401, R"({"error":"auth"})");
     return ap_http::json_response(200,
-        R"({"status":"ok","version":"0.7.0","ts":")" + iso8601_ms_now() + "\"}");
+        R"({"status":"ok","version":"0.8.0","ts":")" + iso8601_ms_now() + "\"}");
 }
 
 ap_http::Response App::handle_status(const ap_http::Request& r)
@@ -362,7 +446,7 @@ ap_http::Response App::handle_status(const ap_http::Request& r)
     o << "\"server\":{";
     o <<   "\"name\":\""            << json_escape(server_name) << "\",";
     o <<   "\"version\":\""         << json_escape(game_ver)    << "\",";
-    o <<   "\"admiralspanel\":\"0.7.0\",";
+    o <<   "\"admiralspanel\":\"0.8.0\",";
     o <<   "\"windrose_plus\":null,"; // kept for panel backwards-compat
     o <<   "\"invite_code\":"       << (invite.empty() ? std::string("null") :
                                          ("\"" + json_escape(invite) + "\"")) << ",";
@@ -462,6 +546,155 @@ ap_http::Response App::handle_rcon(const ap_http::Request& r)
 
     std::string result = spool_submit(cmd, args, 25000);
     return ap_http::json_response(200, result);
+}
+
+// ---------------------------------------------------------------------------
+// Spawn item — admin-only async endpoint. Writes a JSON request file to the
+// spawn-spool directory; an external Python sidecar picks it up, stops the
+// server, modifies the world RocksDB, restarts. Sidecar writes a status file
+// the UI polls via /api/spawn-status?id=<id>.
+// ---------------------------------------------------------------------------
+
+ap_http::Response App::handle_spawn_post(const ap_http::Request& r)
+{
+    if (!is_authenticated_strict(r))
+        return ap_http::json_response(401, R"X({"error":"auth required (admin login)"})X");
+    if (r.method != "POST")
+        return ap_http::json_response(405, R"({"error":"POST required"})");
+
+    // Hand-roll JSON extraction (matches handle_rcon's style).
+    auto extract_string = [&](const std::string& key, std::string& out) -> bool {
+        std::string needle = "\"" + key + "\"";
+        size_t p = r.body.find(needle);
+        if (p == std::string::npos) return false;
+        p = r.body.find(':', p + needle.size());
+        if (p == std::string::npos) return false;
+        ++p;
+        while (p < r.body.size() && std::isspace(static_cast<unsigned char>(r.body[p]))) ++p;
+        if (p >= r.body.size() || r.body[p] != '"') return false;
+        ++p;
+        out.clear();
+        while (p < r.body.size() && r.body[p] != '"') {
+            if (r.body[p] == '\\' && p + 1 < r.body.size()) {
+                char nx = r.body[p + 1];
+                switch (nx) {
+                    case '"':  out += '"';  break;
+                    case '\\': out += '\\'; break;
+                    case 'n':  out += '\n'; break;
+                    case 'r':  out += '\r'; break;
+                    case 't':  out += '\t'; break;
+                    default:   out += nx;   break;
+                }
+                p += 2;
+            } else {
+                out += r.body[p++];
+            }
+        }
+        return true;
+    };
+    auto extract_int = [&](const std::string& key, int& out) -> bool {
+        std::string needle = "\"" + key + "\"";
+        size_t p = r.body.find(needle);
+        if (p == std::string::npos) return false;
+        p = r.body.find(':', p + needle.size());
+        if (p == std::string::npos) return false;
+        ++p;
+        while (p < r.body.size() && std::isspace(static_cast<unsigned char>(r.body[p]))) ++p;
+        char* end = nullptr;
+        long v = std::strtol(r.body.c_str() + p, &end, 10);
+        if (end == r.body.c_str() + p) return false;
+        out = static_cast<int>(v);
+        return true;
+    };
+
+    std::string chest, marker, item_path, item_substr;
+    int count = 0, marker_slot = 0;
+    extract_string("chest",       chest);
+    extract_string("marker",      marker);
+    extract_string("item_path",   item_path);
+    extract_string("item_substr", item_substr);
+    extract_int   ("count",       count);
+    extract_int   ("marker_slot", marker_slot);
+
+    if (chest.empty() && marker.empty())
+        return ap_http::json_response(400, R"({"error":"chest or marker required"})");
+    if (item_path.empty() && item_substr.empty())
+        return ap_http::json_response(400, R"({"error":"item_path or item_substr required"})");
+    if (count <= 0)
+        return ap_http::json_response(400, R"({"error":"count must be positive"})");
+
+    const auto& cfg = ap_cfg::get();
+    std::filesystem::path spawn_dir = std::filesystem::path(cfg.spool_dir) / "spawn";
+    std::error_code ec;
+    std::filesystem::create_directories(spawn_dir, ec);
+
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::string id = "sp_" + std::to_string(now_ms) + "_" + gen_hex_token(4);
+
+    std::ostringstream body;
+    body << "{";
+    body << "\"id\":\"" << id << "\",";
+    body << "\"ts\":"   << now_ms << ",";
+    if (!chest.empty())       body << "\"chest\":\""       << json_escape(chest)       << "\",";
+    if (!marker.empty())      body << "\"marker\":\""      << json_escape(marker)      << "\",";
+    body << "\"marker_slot\":" << marker_slot << ",";
+    if (!item_path.empty())   body << "\"item_path\":\""   << json_escape(item_path)   << "\",";
+    if (!item_substr.empty()) body << "\"item_substr\":\"" << json_escape(item_substr) << "\",";
+    body << "\"count\":" << count;
+    body << "}";
+
+    std::filesystem::path req_path = spawn_dir / ("req_" + id + ".json");
+    {
+        std::ofstream f(req_path, std::ios::binary);
+        f << body.str();
+    }
+
+    std::ostringstream resp;
+    resp << "{\"id\":\"" << id << "\",\"status\":\"queued\"}";
+    return ap_http::json_response(200, resp.str());
+}
+
+ap_http::Response App::handle_spawn_status(const ap_http::Request& r)
+{
+    if (!is_authenticated_strict(r))
+        return ap_http::json_response(401, R"X({"error":"auth required (admin login)"})X");
+
+    // Extract id from query string (?id=...)
+    std::string id;
+    size_t qp = r.query.find("id=");
+    if (qp != std::string::npos) {
+        size_t start = qp + 3;
+        size_t end = r.query.find('&', start);
+        id = r.query.substr(start, (end == std::string::npos) ? std::string::npos : end - start);
+    }
+    if (id.empty())
+        return ap_http::json_response(400, R"({"error":"id query param required"})");
+
+    // Sanitize id: only [A-Za-z0-9_-] allowed
+    for (char c : id) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-')) {
+            return ap_http::json_response(400, R"({"error":"invalid id"})");
+        }
+    }
+
+    const auto& cfg = ap_cfg::get();
+    std::filesystem::path spawn_dir = std::filesystem::path(cfg.spool_dir) / "spawn";
+    std::filesystem::path status_path = spawn_dir / ("status_" + id + ".json");
+    std::filesystem::path req_path    = spawn_dir / ("req_"    + id + ".json");
+
+    if (std::filesystem::exists(status_path)) {
+        std::ifstream f(status_path, std::ios::binary);
+        std::ostringstream o;
+        o << f.rdbuf();
+        return ap_http::json_response(200, o.str());
+    }
+    if (std::filesystem::exists(req_path)) {
+        std::ostringstream o;
+        o << "{\"id\":\"" << id << "\",\"status\":\"queued\"}";
+        return ap_http::json_response(200, o.str());
+    }
+    return ap_http::json_response(404, R"({"error":"id not found"})");
 }
 
 std::string App::spool_submit(const std::string& command,

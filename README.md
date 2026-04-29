@@ -10,6 +10,7 @@ AdmiralsPanel gives you a web UI with buttons, sliders, and presets so you never
 
 - A Windrose Dedicated Server install on Windows (Steam DS SKU).
 - **UE4SS** installed at `R5/Binaries/Win64/ue4ss/`. Get the latest release from <https://github.com/UE4SS-RE/RE-UE4SS/releases/latest> and extract the contents into `R5/Binaries/Win64/`. The installer below will fail with a friendly message if UE4SS is missing.
+- **Python 3.11+** (for the Spawn feature). Get it from <https://www.python.org/downloads/> — make sure to tick "Add Python to PATH" during install. The installer will detect it, install `rocksdict` + `pymongo`, and register a Scheduled Task for the spawn sidecar. Pass `-SkipSidecar` to `install.ps1` to opt out (the rest of the panel still works).
 - That's it for the standalone (default) install. The native DLL hosts its own HTTP server on port 8790 and writes `admiralspanel.json` with a fresh random password on first run.
 - **Optional, legacy**: if you already run [WindrosePlus](https://github.com/HumanGenome/WindrosePlus) v1.0.7+ and want AdmiralsPanel served from its dashboard instead, pass `-WithWindrosePlus` to `install.ps1`.
 
@@ -29,7 +30,8 @@ Standalone install (default):
 2. Installs the Lua mod at `R5\Binaries\Win64\ue4ss\Mods\AdmiralsPanel\`.
 3. Installs the web panel at `admiralspanel_data\web\` (served by the native HTTP server).
 4. Installs `main.dll` (native HTTP server + UFunction bridge) at `R5\Binaries\Win64\ue4ss\Mods\AdmiralsPanelNative\`.
-5. First server start writes `admiralspanel.json` with a random password. Log in at **<http://localhost:8790/>**.
+5. **(v0.8+) Sets up the Spawn feature**: detects Python, runs `pip install rocksdict pymongo`, copies the spawn-item tool into `admiralspanel_data\tools\spawn-item\`, registers Scheduled Task `AdmiralsPanel-Spawn-Sidecar` (auto-starts at boot + logon), and starts it immediately. Pass `-SkipSidecar` to skip.
+6. First server start writes `admiralspanel.json` with a random password. Log in at **<http://localhost:8790/>**.
 
 Sub-mod install (legacy, under WindrosePlus):
 
@@ -64,10 +66,10 @@ Two options:
 Verify the panel is up before opening the browser:
 ```powershell
 curl http://localhost:8790/healthcheck
-# expect: {"status":"ok","app":"AdmiralsPanel","version":"0.7.0"}
+# expect: {"status":"ok","app":"AdmiralsPanel","version":"0.8.0"}
 ```
 
-## What it can do (v0.7)
+## What it can do (v0.8)
 
 **World-tab multipliers** — all live, write directly to the game's reflected data assets:
 
@@ -91,9 +93,15 @@ Each captures originals on first sight and restores cleanly when set to 1.0. **L
 - Live player list with positions, speed slider, "TP to last death" button.
 - `ap.healn` / `ap.damagen` / `ap.killn` / `ap.feedn` / `ap.reviven` — direct GAS attribute writes.
 - `ap.setattrn` / `ap.readattrn` — read/write any of ~150 `R5AttributeSet` fields (MaxHealth, Armor, Damage, all damage-type modifiers, crit stats, etc.).
-- `ap.giveloot <player> [count]` — teleport populated `R5LootActor` instances to the player; their auto-pickup ability delivers the contents.
-- `ap.giveitem <player> <search>` — teleport a loot actor whose contents match a substring (e.g. `ap.giveitem Mancave banana`).
 - `ap.tp` / `ap.tpxyz` — server-authoritative teleport.
+
+**Spawn tab (v0.8+)** — admin-only, password-required even from localhost:
+- Inserts items into chests by writing the world RocksDB save file directly. The previous teleport-based give-item never actually committed server-side; this does.
+- Pick a target chest (by 32-char `BuildingBlock` key OR by marker item placed in slot 0).
+- Pick from a searchable dropdown of all 1268 known items (autocomplete by name; full asset path is auto-resolved).
+- Set count, hit Spawn. Live status panel walks through `queued → stopping_server → writing_db → restarting_server → done`.
+- Server briefly restarts (~10s) for each spawn — connected players are warned + asked to confirm. Subsequent admin spawns don't require re-login (sessions persist across restarts).
+- Implementation: `POST /api/spawn` writes a JSON request to a spool dir; an external Python sidecar (Scheduled Task) picks it up, opens RocksDB with `compression=none`, decodes the chest's BSON, inserts an `FR5BLItem` into the first empty slot, re-encodes, restarts the server. Full doc at [`tools/spawn-item/README.md`](tools/spawn-item/README.md).
 
 **Admin tools**:
 - Announcements (writes to server log + `events.log`).

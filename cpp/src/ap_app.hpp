@@ -31,11 +31,18 @@ private:
     ap_http::Response handle_rcon(const ap_http::Request&);
     ap_http::Response handle_health(const ap_http::Request&);
     ap_http::Response handle_status(const ap_http::Request&);
+    ap_http::Response handle_spawn_post(const ap_http::Request&);
+    ap_http::Response handle_spawn_status(const ap_http::Request&);
 
     // Session helpers
     bool is_authenticated(const ap_http::Request&) const;
+    bool is_authenticated_strict(const ap_http::Request&) const;
     std::string new_session_token();
     static std::string extract_cookie(const ap_http::Request&, const std::string& name);
+
+    // Persistent session storage so server restarts don't force admin re-login.
+    void load_sessions();   // call once on startup; expired entries dropped
+    void save_sessions() const; // call after every mutation (lock-held)
 
     // Spool helpers
     std::string spool_submit(const std::string& command,
@@ -44,7 +51,8 @@ private:
 
     ap_http::Server m_http;
     mutable std::mutex m_sess_mu;
-    std::unordered_map<std::string, std::chrono::steady_clock::time_point> m_sessions;
+    // Token -> creation timestamp (system_clock so it's serializable).
+    std::unordered_map<std::string, std::chrono::system_clock::time_point> m_sessions;
 };
 
 } // namespace ap_app

@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file. Format is l
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-04-29
+
+Server-authoritative item spawning. The previous teleport-based give-item architecture (v0.4–v0.5) was proven broken — items appeared briefly in the HUD but never committed to the server's inventory hierarchy because Windrose's auto-pickup pipeline rejects teleported R5LootActor instances. v0.8 ships a different approach that actually works: write items directly into the world RocksDB save file via a sidecar process and a panel-integrated UI.
+
+### Added
+
+- **`Spawn` tab in the panel UI** — admin-only, password-protected. Pick a target chest (by 32-char BuildingBlock key OR by marker item placed in slot 0), pick an item from a searchable autocomplete dropdown of all 1268 known assets, set count, click Spawn. Live status panel walks through `queued → stopping_server → writing_db → restarting_server → done`. Connected-players warning + confirmation dialog. Recent-spawns history. Tolerates the brief panel-down window during server restart.
+- **`POST /api/spawn`** + **`GET /api/spawn-status?id=<id>`** HTTP endpoints. Both require strict admin auth (no localhost bypass — even local processes need a valid session). Endpoint writes a JSON request file to `admiralspanel_data/rcon/spawn/req_<id>.json` and returns a request ID; the sidecar writes a status file the UI polls.
+- **`ap.itemcatalog`** native command returns JSON `{count, items: [{name, path}, ...]}` for all 1268 loaded `UR5BLInventoryItem` data assets. Used by the Spawn-tab dropdown for full asset-path resolution.
+- **`tools/spawn-item/`** Python sidecar — long-running watcher (`sidecar.py`) that picks up requests from the spool dir, stops the WindroseServer process, opens RocksDB with `compression=none`, decodes the target chest's BSON value, finds the first empty slot, inserts an FR5BLItem with a fresh uuid4 ItemId, re-encodes and writes back, restarts the server, polls until the panel responds. Single-instance enforced via `msvcrt.locking` on `admiralspanel_data/spawn-sidecar.lock`.
+- **`tools/spawn-item/spawn_item.py`** standalone CLI for terminal use — same logic as the sidecar but one-shot. `--chest`/`--marker`, `--item-path`/`--item-substr`, `--count`, `--dry-run`.
+- **Persistent admin sessions** — `App::m_sessions` switched to `system_clock::time_point` and persisted to `admiralspanel_data/sessions.json`. Server restarts no longer wipe admin login (previously every spawn forced a re-login).
+- **Installer auto-setup for the spawn feature** — `install.ps1` step 4 detects Python 3.11+, runs `pip install rocksdict pymongo`, copies `tools/spawn-item/` into `admiralspanel_data/tools/`, and registers a Windows Scheduled Task `AdmiralsPanel-Spawn-Sidecar` that auto-starts the sidecar at system boot and user logon. Pass `-SkipSidecar` to opt out.
+- **`is_authenticated_strict()`** helper — same as `is_authenticated()` but without the 127.0.0.1 bypass. Used for spawn endpoints and any future high-privilege actions.
+- **`tools/spawn-item/README.md`** — full documentation of how the tool works, the BSON schema, the `compression=none` Snappy gotcha, and the architecture rationale.
+
+### Changed
+
+- **DLL `ModVersion`** bumped to 0.8.0; web UI, healthcheck, status JSON, and `ap.versionn` all return 0.8.0.
+- **README.md** + **docs/install.md** — added Spawn feature section, Python prerequisite, and updated `curl /healthcheck` expected output.
+- **Architectural finding documented**: the v0.4–v0.5 give-item teleport+autopickup approach was proven fundamentally broken via end-to-end test (`ap.dumpinv` before/after showed identical inventory hierarchy after every giveitem call). Memory updated; see `docs/giveitem-architecture.md` if added.
+
+### Fixed
+
+- **The "items go poof" bug** — `ap.giveitem` (v0.4–v0.5) appeared to add items to the player's HUD but they vanished on save tick / relog because the auto-pickup never committed server-side. Replaced by `Spawn` tab which writes the canonical save file directly. Old `ap.giveitem` is kept for compatibility but flagged as broken in docs.
+- **Admin re-login on every spawn** — previously sessions were in-memory only; every server restart (including spawn-triggered restarts) wiped them. Now persisted across restarts.
+
+### Notes for upgraders
+
+If you upgrade from v0.7 → v0.8 with players online, run `install.ps1` while the server is up — only `main.dll` gets locked (installer warns and skips); everything else deploys cleanly. Restart the server during a quiet window to load the new DLL. The Scheduled Task starts the sidecar immediately on install regardless.
+
+The spawn feature requires **Python 3.11+** on PATH. If the installer can't find Python it warns and skips the spawn-tool setup — the rest of the panel still installs fine.
+
 ## [0.7.0] — 2026-04-28
 
 World-tab multipliers actually work now. The whole "World" tab was previously a lie — every slider wrote to non-existent properties on `R5GameMode` and the success message was fabricated by UE4SS's pcall silently swallowing the no-op writes.

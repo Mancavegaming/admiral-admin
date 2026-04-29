@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -297,7 +298,7 @@ static bool apply_damage(AActor* target, float amount, float* out_return = nullp
 // ap_native_version() -> string
 static int lua_version(const LuaMadeSimple::Lua& lua)
 {
-    lua.set_string("0.2.0");
+    lua.set_string("0.8.0");
     return 1;
 }
 
@@ -2882,6 +2883,63 @@ static int lua_itemlist(const LuaMadeSimple::Lua& lua)
     return 1;
 }
 
+// ap_native_itemcatalog() -> JSON array of every loaded UR5BLInventoryItem
+// with its short name, display name, and full asset path. Used by the panel
+// UI to populate the Spawn-tab dropdown so admins can pick any item, not
+// just ones currently in chests.
+static int lua_itemcatalog(const LuaMadeSimple::Lua& lua)
+{
+    auto items = gather_all_items();
+
+    auto j_escape = [](std::string_view s) -> std::string {
+        std::string out;
+        out.reserve(s.size() + 2);
+        for (char c : s) {
+            switch (c) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n";  break;
+                case '\r': out += "\\r";  break;
+                case '\t': out += "\\t";  break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        char buf[8]; std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                        out += buf;
+                    } else out.push_back(c);
+            }
+        }
+        return out;
+    };
+
+    std::string out = "{\"count\":" + std::to_string(items.size()) + ",\"items\":[";
+    bool first = true;
+    for (const auto& e : items) {
+        if (!first) out += ",";
+        first = false;
+
+        // GetFullName returns "ClassName /Path/To.AssetName" — we want only
+        // the path part after the space. Append ".AssetName" suffix to make
+        // it resolvable for asset loading (matches in-engine soft-ref form).
+        std::wstring full = e.obj->GetFullName();
+        std::string  full_n = w_to_narrow(full);
+        auto sp = full_n.find(' ');
+        std::string path = (sp != std::string::npos) ? full_n.substr(sp + 1) : full_n;
+        // Asset paths in BuildingBlock records follow "/Path/To/Name.Name"
+        // form (the .AssetName duplicate). UR5BLInventoryItem objects have
+        // GetFullName like "/R5BusinessRules/.../DA_X.DA_X" already if the
+        // outer is the package; otherwise they're "Class /Path:Inner".
+        // For data assets the form is "/Game/Path/Asset.Asset" — already
+        // matches the asset-path convention. Don't munge.
+
+        std::string short_n = w_to_narrow(e.display_name);
+        out += "{\"name\":\"" + j_escape(short_n) +
+               "\",\"path\":\"" + j_escape(path) + "\"}";
+    }
+    out += "]}";
+    lua.set_string(out);
+    return 1;
+}
+
 // ap_native_itemscan(target, [bytes]) -> scan an object's raw memory for any
 // references to known UR5BLInventoryItem data assets. Debug tool to verify
 // the ref-scan technique on live inventory views (chests, etc.) without
@@ -3383,6 +3441,472 @@ static int lua_spawn(const LuaMadeSimple::Lua& lua)
     return 1;
 }
 
+// ap_native_dumpinv(player) -> string. Recon command for "is the inventory
+// hierarchy actually populated server-side after ap.giveitem?". Run before
+// and after a give-item to compare. Reports:
+//   1. Object-typed properties on player.controller/state/pawn whose value
+//      class hints at the inventory hierarchy (R5BL*, Inventory*, Account*,
+//      DataKeeper*, PlayerView*) — surfaces the reflected link if any.
+//   2. Counts of every R5BL view-class instance live in the UObject table.
+//   3. First 5 R5BLPlayerView and 10 *InventoryModuleView* full paths
+//      (Outer chain visible in full path → tells us the ownership tree).
+//   4. Every R5BLInventorySlotView whose 0x60-byte memory scan matches a
+//      known UR5BLInventoryItem ref, with its int32 count at +0x58.
+//
+// If "the item is in inventory server-side" matches "the item appears in a
+// populated SlotView whose Outer chain reaches our player", give-item
+// succeeded server-side and the poof is in client sync. If not, the
+// auto-pickup pipeline never committed to the inventory hierarchy.
+static int lua_dumpinv(const LuaMadeSimple::Lua& lua)
+{
+    if (!lua.is_string()) { lua.set_string("usage: ap_native_dumpinv(player)"); return 1; }
+    auto target_lower = to_wlower(lua.get_string());
+    auto player = find_player_by_name(target_lower);
+    if (!player.controller) { lua.set_string("player not found"); return 1; }
+
+    std::string out;
+    char buf[600];
+    std::snprintf(buf, sizeof(buf),
+        "== ap.dumpinv: %s ==\n"
+        "  Controller @0x%p  State @0x%p  Pawn @0x%p\n\n",
+        w_to_narrow(player.name).c_str(),
+        (void*)player.controller, (void*)player.state, (void*)player.pawn);
+    out += buf;
+
+    // Helper: dump raw-object-pointer properties on `obj` whose VALUE's class
+    // name hints at inventory hierarchy. Only handles UType*/AType* raw
+    // pointer properties (skips TSoft/TWeak/TLazy variants for crash-safety).
+    auto dump_link_props = [&](const char* label, UObject* obj) {
+        if (!obj) return;
+        auto* cls = obj->GetClassPrivate();
+        if (!cls) return;
+        std::snprintf(buf, sizeof(buf),
+            "  -- %s (cls=%s) candidate link properties:\n",
+            label, w_to_narrow(cls->GetName()).c_str());
+        out += buf;
+        auto* asStruct = reinterpret_cast<RC::Unreal::UStruct*>(cls);
+        int shown = 0;
+        for (auto* prop : asStruct->ForEachPropertyInChain()) {
+            if (!prop) continue;
+            auto type_str = std::wstring(*prop->GetCPPType());
+            // Only raw object pointers: starts with U/A, ends with *
+            if (type_str.size() < 2) continue;
+            if (type_str.back() != L'*') continue;
+            if (type_str.front() != L'U' && type_str.front() != L'A') continue;
+            if (type_str.find(STR("TSoft")) != std::wstring::npos) continue;
+            if (type_str.find(STR("TWeak")) != std::wstring::npos) continue;
+            if (type_str.find(STR("TLazy")) != std::wstring::npos) continue;
+
+            auto** ppval = prop->ContainerPtrToValuePtr<UObject*>(obj);
+            if (!ppval) continue;
+            UObject* val = *ppval;
+            if (!val) continue;
+            if (!is_readable(val, 0x30)) continue;
+            auto* vcls = val->GetClassPrivate();
+            if (!vcls) continue;
+            std::wstring vc(vcls->GetName());
+            bool interesting =
+                vc.find(STR("R5BL"))       != std::wstring::npos ||
+                vc.find(STR("Inventory"))  != std::wstring::npos ||
+                vc.find(STR("Account"))    != std::wstring::npos ||
+                vc.find(STR("DataKeeper")) != std::wstring::npos ||
+                vc.find(STR("PlayerView")) != std::wstring::npos;
+            if (!interesting) continue;
+
+            std::snprintf(buf, sizeof(buf),
+                "      %-32s -> %s @0x%p\n",
+                w_to_narrow(prop->GetName()).c_str(),
+                w_to_narrow(vc).c_str(),
+                (void*)val);
+            out += buf;
+            shown++;
+        }
+        if (shown == 0) out += "      (no R5BL/Inventory/Account-shaped raw-pointer properties found)\n";
+        out += "\n";
+    };
+
+    out += "PROPERTY SCAN — looking for the link from player to inventory hierarchy:\n";
+    dump_link_props("PlayerController", player.controller);
+    dump_link_props("PlayerState",      player.state);
+    dump_link_props("Pawn",             reinterpret_cast<UObject*>(player.pawn));
+
+    // Gather inventory-hierarchy view instances in one pass
+    struct ViewInst { UObject* obj; std::wstring cls; std::wstring full; };
+    std::vector<ViewInst> player_views, account_views, module_views, slot_views;
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur) return LoopAction::Continue;
+        auto* cls = cur->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        std::wstring_view cn(cls->GetName());
+        auto full = cur->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+        if (cn == STR("R5BLPlayerView"))                                            player_views.push_back({cur, std::wstring(cn), full});
+        else if (cn == STR("R5BLAccountView"))                                      account_views.push_back({cur, std::wstring(cn), full});
+        else if (cn.find(STR("InventoryModuleView")) != std::wstring_view::npos)    module_views.push_back({cur, std::wstring(cn), full});
+        else if (cn == STR("R5BLInventorySlotView"))                                slot_views.push_back({cur, std::wstring(cn), full});
+        return LoopAction::Continue;
+    });
+
+    std::snprintf(buf, sizeof(buf),
+        "INVENTORY VIEW INSTANCE COUNTS (live UObject table):\n"
+        "  R5BLPlayerView         x %zu\n"
+        "  R5BLAccountView        x %zu\n"
+        "  *InventoryModuleView*  x %zu\n"
+        "  R5BLInventorySlotView  x %zu\n\n",
+        player_views.size(), account_views.size(),
+        module_views.size(), slot_views.size());
+    out += buf;
+
+    out += "FIRST 5 R5BLPlayerView instances (Outer chain in full path):\n";
+    for (size_t i = 0; i < player_views.size() && i < 5; ++i) {
+        std::snprintf(buf, sizeof(buf), "  [%zu] @0x%p\n      %s\n",
+            i, (void*)player_views[i].obj,
+            w_to_narrow(player_views[i].full).substr(0, 360).c_str());
+        out += buf;
+    }
+    out += "\n";
+
+    out += "FIRST 10 *InventoryModuleView* instances:\n";
+    for (size_t i = 0; i < module_views.size() && i < 10; ++i) {
+        std::snprintf(buf, sizeof(buf), "  [%zu] cls=%s @0x%p\n      %s\n",
+            i, w_to_narrow(module_views[i].cls).c_str(),
+            (void*)module_views[i].obj,
+            w_to_narrow(module_views[i].full).substr(0, 360).c_str());
+        out += buf;
+    }
+    out += "\n";
+
+    // For every slot, scan_for_item_refs across the 0x60-byte slot memory
+    auto items = gather_all_items();
+    out += "POPULATED R5BLInventorySlotView instances (memory scan against known items):\n";
+    int populated = 0;
+    for (size_t i = 0; i < slot_views.size(); ++i) {
+        const auto& s = slot_views[i];
+        std::vector<const InvItemEntry*> hits;
+        scan_for_item_refs(s.obj, 0x60, items, hits, 4);
+        if (hits.empty()) continue;
+        int32_t count = 0;
+        if (is_readable(reinterpret_cast<const uint8_t*>(s.obj) + 0x58, 4)) {
+            count = *reinterpret_cast<const int32_t*>(
+                reinterpret_cast<const uint8_t*>(s.obj) + 0x58);
+        }
+        std::snprintf(buf, sizeof(buf), "  [%zu] @0x%p  count(+0x58)=%d  items:",
+            i, (void*)s.obj, count);
+        out += buf;
+        for (auto* e : hits) {
+            out += " ";
+            out += w_to_narrow(e->display_name);
+        }
+        out += "\n      ";
+        out += w_to_narrow(s.full).substr(0, 320);
+        out += "\n";
+        populated++;
+        if (populated >= 60) {
+            out += "  [capped at 60 populated slots]\n";
+            break;
+        }
+    }
+    std::snprintf(buf, sizeof(buf),
+        "\n[populated slots (UObject ref scan): %d / total slots scanned: %zu / known items: %zu]\n\n",
+        populated, slot_views.size(), items.size());
+    out += buf;
+
+    // STRING SCAN: search slot memory + 1-level pointer chase for the
+    // "/R5BusinessRules/InventoryItems/" asset path substring (ASCII and
+    // UTF-16 LE). Server stores inventory item refs as soft-path strings,
+    // not as direct UObject* pointers, so the typed-ref scan above misses
+    // them. This scan catches them.
+    out += "STRING SCAN of SlotViews (looking for /R5BusinessRules/ asset paths):\n";
+    static const char pat[] = "/R5BusinessRules/Inventor";
+    static const size_t plen = sizeof(pat) - 1;
+    int string_populated = 0;
+    for (size_t i = 0; i < slot_views.size(); ++i) {
+        const auto& s = slot_views[i];
+        const uint8_t* slot_bytes = reinterpret_cast<const uint8_t*>(s.obj);
+        if (!is_readable(slot_bytes, 0x60)) continue;
+
+        // Collect bytes: slot itself + 1 level of heap-pointer targets.
+        std::vector<uint8_t> bag;
+        bag.insert(bag.end(), slot_bytes, slot_bytes + 0x60);
+
+        uintptr_t arena = reinterpret_cast<uintptr_t>(s.obj) >> 40;
+        for (size_t off = 0x28; off + 8 <= 0x60; off += 8) {
+            uintptr_t v = *reinterpret_cast<const uintptr_t*>(slot_bytes + off);
+            if (v < 0x10000) continue;
+            if ((v >> 40) != arena) continue;       // outside heap arena
+            if (v & 7) continue;                    // misaligned
+            const uint8_t* tgt = reinterpret_cast<const uint8_t*>(v);
+            if (!is_readable(tgt, 0x100)) continue;
+            bag.insert(bag.end(), tgt, tgt + 0x100);
+        }
+
+        std::vector<std::string> hits;
+
+        // ASCII substring scan
+        for (size_t b = 0; b + plen <= bag.size(); ++b) {
+            if (std::memcmp(bag.data() + b, pat, plen) != 0) continue;
+            std::string txt;
+            size_t p = b;
+            while (p < bag.size() && bag[p] >= 0x20 && bag[p] < 0x7f && txt.size() < 220)
+                txt += static_cast<char>(bag[p++]);
+            hits.push_back(std::move(txt));
+        }
+        // UTF-16 LE substring scan (each char followed by 0x00)
+        for (size_t b = 0; b + plen * 2 <= bag.size(); b += 2) {
+            bool match = true;
+            for (size_t j = 0; j < plen; ++j) {
+                if (bag[b + j*2] != static_cast<uint8_t>(pat[j])) { match = false; break; }
+                if (bag[b + j*2 + 1] != 0)                       { match = false; break; }
+            }
+            if (!match) continue;
+            std::string txt;
+            size_t p = b;
+            while (p + 1 < bag.size() && bag[p] >= 0x20 && bag[p] < 0x7f && bag[p+1] == 0 && txt.size() < 220) {
+                txt += static_cast<char>(bag[p]);
+                p += 2;
+            }
+            hits.push_back("[utf16] " + txt);
+        }
+
+        if (hits.empty()) continue;
+        string_populated++;
+        std::snprintf(buf, sizeof(buf), "  [%zu] @0x%p\n", i, (void*)s.obj);
+        out += buf;
+        for (const auto& h : hits) {
+            out += "    " + h + "\n";
+        }
+        if (string_populated >= 60) {
+            out += "  [capped at 60]\n";
+            break;
+        }
+    }
+    std::snprintf(buf, sizeof(buf),
+        "\n[string-scan populated slots: %d / total: %zu]\n\n",
+        string_populated, slot_views.size());
+    out += buf;
+
+    // FULL TREE SCAN — every UObject whose full path contains the player's
+    // AccountView name (covers PlayerView descendants AND siblings). For each:
+    //   - scan first 0x800 bytes of the object for asset path strings
+    //   - follow every 8-aligned heap pointer in [0x28..0x100] one level and
+    //     scan the target's first 0x400 bytes for asset path strings too
+    // Items in modules/slots store their asset path in heap-allocated FString
+    // memory pointed to from the module/slot UObject; this catches that.
+    out += "FULL TREE SCAN — every UObject under Mancave's AccountView:\n";
+    if (player_views.empty() || account_views.empty()) {
+        out += "  no R5BLPlayerView/AccountView found\n";
+    } else {
+        std::wstring scope_name(account_views[0].obj->GetName());  // broader: AccountView
+        std::set<std::string> unique_paths;
+        std::unordered_set<uintptr_t> scanned_targets;
+        int tree_objs = 0;
+        int ptr_targets_scanned = 0;
+
+        auto scan_buf_for_path = [&](const uint8_t* ptr, size_t len) -> std::vector<std::string> {
+            std::vector<std::string> hits;
+            for (size_t b = 0; b + plen <= len; ++b) {
+                if (std::memcmp(ptr + b, pat, plen) != 0) continue;
+                std::string txt;
+                size_t p = b;
+                while (p < len && ptr[p] >= 0x20 && ptr[p] < 0x7f && txt.size() < 220)
+                    txt += static_cast<char>(ptr[p++]);
+                hits.push_back(std::move(txt));
+            }
+            return hits;
+        };
+
+        UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+            if (!cur) return LoopAction::Continue;
+            auto full = cur->GetFullName();
+            if (full.find(scope_name) == std::wstring::npos) return LoopAction::Continue;
+
+            const uint8_t* base = reinterpret_cast<const uint8_t*>(cur);
+            const size_t scan_size = 0x800;
+            if (!is_readable(base, scan_size)) return LoopAction::Continue;
+
+            std::vector<std::string> hits = scan_buf_for_path(base, scan_size);
+
+            // 1-level heap pointer chase, payload range only (skip header 0x28)
+            uintptr_t arena = reinterpret_cast<uintptr_t>(cur) >> 40;
+            for (size_t off = 0x28; off + 8 <= 0x100; off += 8) {
+                uintptr_t v = *reinterpret_cast<const uintptr_t*>(base + off);
+                if (v < 0x10000) continue;
+                if ((v >> 40) != arena) continue;
+                if (v & 7) continue;
+                if (scanned_targets.count(v)) continue;
+                scanned_targets.insert(v);
+                const uint8_t* tgt = reinterpret_cast<const uint8_t*>(v);
+                if (!is_readable(tgt, 0x400)) continue;
+                ptr_targets_scanned++;
+                auto tgt_hits = scan_buf_for_path(tgt, 0x400);
+                for (auto& h : tgt_hits) hits.push_back("[via ptr@0x" + std::to_string(off) + "] " + h);
+            }
+
+            if (!hits.empty()) {
+                auto* cls = cur->GetClassPrivate();
+                std::string cn = cls ? w_to_narrow(cls->GetName()) : "<no class>";
+                std::snprintf(buf, sizeof(buf), "  %s @0x%p (%s)\n",
+                    cn.c_str(), (void*)cur,
+                    w_to_narrow(cur->GetName()).c_str());
+                out += buf;
+                for (const auto& h : hits) {
+                    out += "    " + h + "\n";
+                    // Strip the [via ptr@] prefix when adding to unique set
+                    auto pos = h.find("] ");
+                    std::string clean = (pos != std::string::npos && h.substr(0,5) == "[via ")
+                        ? h.substr(pos + 2) : h;
+                    unique_paths.insert(clean);
+                }
+            }
+            tree_objs++;
+            return LoopAction::Continue;
+        });
+
+        std::snprintf(buf, sizeof(buf),
+            "\n[tree objects scanned: %d, ptr targets followed: %d, unique asset paths: %zu]\n",
+            tree_objs, ptr_targets_scanned, unique_paths.size());
+        out += buf;
+        out += "DISTINCT items in Mancave's tree:\n";
+        for (const auto& p : unique_paths) {
+            out += "  " + p + "\n";
+        }
+    }
+
+    lua.set_string(out);
+    return 1;
+}
+
+// ap_native_overwriteinv(player, [from], [to]) -> string. Test command:
+// finds ASCII and UTF-16 LE occurrences of `from` in the player's tree
+// memory (UObject bytes + 1-level heap pointer targets) and overwrites
+// each with `to`, null-padding the trailing length difference. Used to
+// verify whether direct server-side memory writes propagate to the client
+// (changes visible in HUD = yes, no change = client sync would overwrite
+// us / replication is one-way client->server).
+//
+// Defaults: from="DA_EID_Tool_Pickaxe_T00", to="DA_EID_Tool_Axe_T00".
+// If your pickaxe slot visually becomes an axe, direct memory write is a
+// viable give-item path. If not, we need RocksDB save-file write or to
+// find the C++ rule via pattern scanning.
+static int lua_overwriteinv(const LuaMadeSimple::Lua& lua)
+{
+    if (!lua.is_string()) { lua.set_string("usage: ap_native_overwriteinv(player, [from], [to])"); return 1; }
+    auto target_lower = to_wlower(lua.get_string());
+
+    std::string from_pat = "DA_EID_Tool_Pickaxe_T00";
+    std::string to_pat   = "DA_EID_Tool_Axe_T00";
+    if (lua.is_string()) from_pat = std::string(lua.get_string());
+    if (lua.is_string()) to_pat   = std::string(lua.get_string());
+
+    if (to_pat.size() > from_pat.size()) {
+        lua.set_string("'to' must be no longer than 'from' (in-place only)");
+        return 1;
+    }
+
+    auto player = find_player_by_name(target_lower);
+    if (!player.controller) { lua.set_string("player not found"); return 1; }
+
+    // Locate first R5BLPlayerView (single-player assumption for now)
+    UObject* player_view = nullptr;
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur || player_view) return player_view ? LoopAction::Break : LoopAction::Continue;
+        auto* cls = cur->GetClassPrivate();
+        if (!cls) return LoopAction::Continue;
+        if (std::wstring_view(cls->GetName()) != STR("R5BLPlayerView")) return LoopAction::Continue;
+        auto full = cur->GetFullName();
+        if (full.find(STR("Default__")) != std::wstring::npos) return LoopAction::Continue;
+        player_view = cur;
+        return LoopAction::Break;
+    });
+    if (!player_view) { lua.set_string("R5BLPlayerView not found in live UObjects"); return 1; }
+    std::wstring scope_name(player_view->GetName());
+
+    // Helper: try to make region writable, return old protect (0 if failed)
+    auto ensure_writable = [](void* p, size_t len, DWORD* old_out) -> bool {
+        if (!p || len == 0) return false;
+        return VirtualProtect(p, len, PAGE_READWRITE, old_out) != 0;
+    };
+    auto restore_protect = [](void* p, size_t len, DWORD old_protect) {
+        if (!p || len == 0) return;
+        DWORD tmp;
+        VirtualProtect(p, len, old_protect, &tmp);
+    };
+
+    int writes_ascii = 0, writes_utf16 = 0;
+    std::unordered_set<uintptr_t> scanned_targets;
+
+    auto overwrite_ascii = [&](uint8_t* buf, size_t len) {
+        DWORD old; if (!ensure_writable(buf, len, &old)) return;
+        for (size_t b = 0; b + from_pat.size() <= len; ++b) {
+            if (std::memcmp(buf + b, from_pat.data(), from_pat.size()) != 0) continue;
+            std::memcpy(buf + b, to_pat.data(), to_pat.size());
+            std::memset(buf + b + to_pat.size(), 0, from_pat.size() - to_pat.size());
+            writes_ascii++;
+        }
+        restore_protect(buf, len, old);
+    };
+    auto overwrite_utf16 = [&](uint8_t* buf, size_t len) {
+        DWORD old; if (!ensure_writable(buf, len, &old)) return;
+        for (size_t b = 0; b + from_pat.size() * 2 <= len; b += 2) {
+            bool match = true;
+            for (size_t j = 0; j < from_pat.size(); ++j) {
+                if (buf[b + j*2] != static_cast<uint8_t>(from_pat[j])) { match = false; break; }
+                if (buf[b + j*2 + 1] != 0)                              { match = false; break; }
+            }
+            if (!match) continue;
+            for (size_t j = 0; j < to_pat.size(); ++j) {
+                buf[b + j*2]     = static_cast<uint8_t>(to_pat[j]);
+                buf[b + j*2 + 1] = 0;
+            }
+            for (size_t j = to_pat.size(); j < from_pat.size(); ++j) {
+                buf[b + j*2]     = 0;
+                buf[b + j*2 + 1] = 0;
+            }
+            writes_utf16++;
+        }
+        restore_protect(buf, len, old);
+    };
+
+    UObjectGlobals::ForEachUObject([&](UObject* cur, int32, int32) {
+        if (!cur) return LoopAction::Continue;
+        auto full = cur->GetFullName();
+        if (full.find(scope_name) == std::wstring::npos) return LoopAction::Continue;
+
+        uint8_t* base = reinterpret_cast<uint8_t*>(cur);
+        const size_t scan_size = 0x800;
+        if (!is_readable(base, scan_size)) return LoopAction::Continue;
+        overwrite_ascii(base, scan_size);
+        overwrite_utf16(base, scan_size);
+
+        uintptr_t arena = reinterpret_cast<uintptr_t>(cur) >> 40;
+        for (size_t off = 0x28; off + 8 <= 0x100; off += 8) {
+            uintptr_t v = *reinterpret_cast<const uintptr_t*>(base + off);
+            if (v < 0x10000) continue;
+            if ((v >> 40) != arena) continue;
+            if (v & 7) continue;
+            if (scanned_targets.count(v)) continue;
+            scanned_targets.insert(v);
+            uint8_t* tgt = reinterpret_cast<uint8_t*>(v);
+            if (!is_readable(tgt, 0x400)) continue;
+            overwrite_ascii(tgt, 0x400);
+            overwrite_utf16(tgt, 0x400);
+        }
+        return LoopAction::Continue;
+    });
+
+    char outbuf[400];
+    std::snprintf(outbuf, sizeof(outbuf),
+        "Overwrote '%s' -> '%s' in %s's tree.\n"
+        "  ASCII writes:  %d\n"
+        "  UTF-16 writes: %d\n"
+        "Check HUD: did your pickaxe slot become an axe?",
+        from_pat.c_str(), to_pat.c_str(),
+        w_to_narrow(player.name).c_str(),
+        writes_ascii, writes_utf16);
+    lua.set_string(std::string(outbuf));
+    return 1;
+}
+
 // ap_native_kill(name) -> string. Sets Health to 0 via AttributeSet direct write.
 static int lua_kill(const LuaMadeSimple::Lua& lua)
 {
@@ -3407,10 +3931,10 @@ public:
     AdmiralsPanelNative() : CppUserModBase()
     {
         ModName = STR("AdmiralsPanel-Native");
-        ModVersion = STR("0.7.0");
+        ModVersion = STR("0.8.0");
         ModDescription = STR("Native UFunction bridge + standalone HTTP server for AdmiralsPanel");
         ModAuthors = STR("Mancavegaming");
-        Output::send<LogLevel::Verbose>(STR("[AdmiralsPanel-Native] loaded (v0.7.0)\n"));
+        Output::send<LogLevel::Verbose>(STR("[AdmiralsPanel-Native] loaded (v0.8.0)\n"));
 
         // v0.6 standalone mode: load config, start our own HTTP server +
         // session + spool bridge. Running alongside WindrosePlus on port
@@ -3473,10 +3997,13 @@ public:
         lua.register_function("admiralspanel_native_lootitems", lua_lootitems);
         lua.register_function("admiralspanel_native_giveitem",  lua_giveitem);
         lua.register_function("admiralspanel_native_itemlist",  lua_itemlist);
+        lua.register_function("admiralspanel_native_itemcatalog", lua_itemcatalog);
         lua.register_function("admiralspanel_native_itemscan",  lua_itemscan);
         lua.register_function("admiralspanel_native_lootslots", lua_lootslots);
         lua.register_function("admiralspanel_native_inspect", lua_inspect);
         lua.register_function("admiralspanel_native_kill",    lua_kill);
+        lua.register_function("admiralspanel_native_dumpinv", lua_dumpinv);
+        lua.register_function("admiralspanel_native_overwriteinv", lua_overwriteinv);
         Output::send<LogLevel::Verbose>(
             STR("[AdmiralsPanel-Native] registered bindings for mod: {}\n"), mod_name);
     }

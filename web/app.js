@@ -771,7 +771,264 @@ document.addEventListener("DOMContentLoaded", () => {
     });
     state.activeTab = "players";
 
+    initSpawnTab();
+
     pollStatus();
     setInterval(pollStatus, POLL_INTERVAL_MS);
     setInterval(pollStats, POLL_STATS_MS);
 });
+
+// ---------------------------------------------------------------------------
+// Spawn item tab
+// ---------------------------------------------------------------------------
+
+const spawnState = {
+    history: [],            // {id, request, status, result, ts}
+    pollTimer: null,
+    itemCatalog: {},        // short_name -> full_path map (loaded from ap.itemcatalog)
+    itemCatalogLoading: false,
+};
+
+function initSpawnTab() {
+    const form = document.getElementById("spawn-form");
+    if (!form) return;
+
+    // Toggle marker-slot row visibility on chest-mode change
+    document.querySelectorAll('input[name="chest-mode"]').forEach(r => {
+        r.addEventListener("change", () => {
+            const mode = document.querySelector('input[name="chest-mode"]:checked').value;
+            const slotRow = document.getElementById("spawn-marker-slot-row");
+            slotRow.classList.toggle("hidden", mode !== "marker");
+            const inp = document.getElementById("spawn-chest");
+            inp.placeholder = (mode === "key")
+                ? "e.g. A19BDE2BCE1847084BB948AC1B79646A"
+                : "e.g. ScallopShell";
+        });
+    });
+
+    // Item catalog: load on first activation; refresh button rebuilds.
+    document.getElementById("item-catalog-refresh")?.addEventListener("click", () => {
+        loadItemCatalog(true);
+    });
+
+    // As user types, show resolved path under the input
+    const itemInput = document.getElementById("spawn-item");
+    itemInput.addEventListener("input", updateItemResolved);
+    updateItemResolved();
+
+    // Update warning text based on connected players
+    setInterval(updateSpawnWarning, 2000);
+    updateSpawnWarning();
+
+    form.addEventListener("submit", onSpawnSubmit);
+
+    // Hook tab activation to load catalog lazily
+    const spawnBtn = document.querySelector('.tab-btn[data-tab="spawn"]');
+    if (spawnBtn) {
+        spawnBtn.addEventListener("click", () => {
+            if (Object.keys(spawnState.itemCatalog).length === 0 && !spawnState.itemCatalogLoading) {
+                loadItemCatalog();
+            }
+        });
+    }
+}
+
+async function loadItemCatalog(force = false) {
+    if (spawnState.itemCatalogLoading) return;
+    spawnState.itemCatalogLoading = true;
+    const counter = document.getElementById("item-catalog-count");
+    counter.textContent = "loading…";
+
+    try {
+        const r = await rcon("ap.itemcatalog");
+        if (!r || r.status !== "ok" || !r.message) {
+            counter.textContent = "load failed";
+            return;
+        }
+        const data = JSON.parse(r.message);
+        const map = {};
+        const list = document.getElementById("item-catalog");
+        list.innerHTML = "";
+        for (const item of data.items) {
+            map[item.name] = item.path;
+            const opt = document.createElement("option");
+            opt.value = item.name;
+            list.appendChild(opt);
+        }
+        spawnState.itemCatalog = map;
+        counter.textContent = `${data.count} items loaded`;
+        updateItemResolved();
+    } catch (e) {
+        console.warn("itemcatalog load error:", e);
+        counter.textContent = "load failed";
+    } finally {
+        spawnState.itemCatalogLoading = false;
+    }
+}
+
+function updateItemResolved() {
+    const inp = document.getElementById("spawn-item");
+    const out = document.getElementById("spawn-item-resolved");
+    if (!inp || !out) return;
+    const v = inp.value.trim();
+    if (!v) { out.textContent = ""; return; }
+    if (v.startsWith("/R5BusinessRules/")) {
+        out.textContent = "→ submitting as full path";
+        return;
+    }
+    const path = spawnState.itemCatalog[v];
+    if (path) {
+        out.textContent = "→ " + path;
+        out.className = "text-xs text-emerald-300/70 mt-1 font-mono";
+    } else {
+        out.textContent = "→ submitting as substring (sidecar will search DB)";
+        out.className = "text-xs text-cream/50 mt-1 font-mono";
+    }
+}
+
+function updateSpawnWarning() {
+    const w = document.getElementById("spawn-warning");
+    if (!w) return;
+    const n = state.status?.server?.player_count ?? 0;
+    if (n > 0) {
+        w.textContent = `${n} player(s) connected — they will be disconnected.`;
+    } else {
+        w.textContent = "Server is empty — safe to spawn.";
+    }
+}
+
+async function onSpawnSubmit(ev) {
+    ev.preventDefault();
+
+    // Build request body
+    const chestMode = document.querySelector('input[name="chest-mode"]:checked').value;
+    const chestVal  = document.getElementById("spawn-chest").value.trim();
+    const itemVal   = document.getElementById("spawn-item").value.trim();
+    const count     = parseInt(document.getElementById("spawn-count").value, 10);
+    const markerSlot = parseInt(document.getElementById("spawn-marker-slot").value, 10) || 0;
+
+    if (!chestVal) { toast("chest input is empty", "error"); return; }
+    if (!itemVal)  { toast("item input is empty", "error");  return; }
+    if (!Number.isFinite(count) || count <= 0) { toast("count must be > 0", "error"); return; }
+
+    const body = { count };
+    if (chestMode === "key") body.chest = chestVal;
+    else { body.marker = chestVal; body.marker_slot = markerSlot; }
+
+    // Item resolution: full path > catalog match > substring search
+    if (itemVal.startsWith("/R5BusinessRules/")) {
+        body.item_path = itemVal;
+    } else if (spawnState.itemCatalog[itemVal]) {
+        body.item_path = spawnState.itemCatalog[itemVal];
+    } else {
+        body.item_substr = itemVal;
+    }
+
+    // Confirm if players online
+    const n = state.status?.server?.player_count ?? 0;
+    if (n > 0 && !confirm(`${n} player(s) currently online. They will be disconnected by the server restart. Proceed?`)) {
+        return;
+    }
+
+    const submitBtn = document.getElementById("spawn-submit");
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Submitting...";
+
+    try {
+        const r = await fetch("/api/spawn", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            credentials: "include",
+        });
+        if (r.status === 401) { show401(); return; }
+        const j = await r.json();
+        if (!r.ok || j.error) {
+            toast("spawn failed: " + (j.error || r.status), "error");
+            return;
+        }
+        // Show status panel + start polling
+        showSpawnStatus(j.id, body);
+        pollSpawnStatusUntilDone(j.id, body);
+    } catch (e) {
+        toast("network error: " + e.message, "error");
+    } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Spawn";
+    }
+}
+
+function showSpawnStatus(id, request) {
+    const card = document.getElementById("spawn-status");
+    card.classList.remove("hidden");
+    setText("spawn-status-id", id);
+    setText("spawn-status-text", "queued");
+    setText("spawn-status-detail",
+        `target: ${request.chest || "marker:" + request.marker}\n` +
+        `item:   ${request.item_path || "substr:" + request.item_substr}\n` +
+        `count:  ${request.count}`);
+}
+
+async function pollSpawnStatusUntilDone(id, request) {
+    if (spawnState.pollTimer) clearInterval(spawnState.pollTimer);
+    let lastStatus = "";
+    let panelDownStreak = 0;
+    spawnState.pollTimer = setInterval(async () => {
+        try {
+            const r = await fetch("/api/spawn-status?id=" + encodeURIComponent(id), {
+                credentials: "include",
+            });
+            // During the restart phase, panel is briefly down — tolerate that.
+            if (!r.ok && r.status !== 401) {
+                panelDownStreak++;
+                setText("spawn-status-text", `restarting_server (${panelDownStreak * 1.5}s)…`);
+                return;
+            }
+            if (r.status === 401) {
+                clearInterval(spawnState.pollTimer);
+                show401();
+                return;
+            }
+            panelDownStreak = 0;
+            const j = await r.json();
+            if (j.status && j.status !== lastStatus) {
+                lastStatus = j.status;
+                setText("spawn-status-text", j.status);
+            }
+            if (j.status === "done") {
+                clearInterval(spawnState.pollTimer);
+                setText("spawn-status-detail",
+                    `chest: ${j.chest}\nitem:  ${j.item}\ncount: ${j.count}\nslot:  ${j.slot}`);
+                toast(`Spawned ${j.count} into slot ${j.slot}`, "ok");
+                addSpawnHistory(id, request, j);
+            } else if (j.status === "failed") {
+                clearInterval(spawnState.pollTimer);
+                setText("spawn-status-detail", "ERROR: " + (j.error || "unknown"));
+                toast("spawn failed: " + (j.error || "unknown"), "error");
+                addSpawnHistory(id, request, j);
+            }
+        } catch (e) {
+            // Network blip during restart — tolerate
+            panelDownStreak++;
+            setText("spawn-status-text", `restarting_server (${panelDownStreak * 1.5}s)…`);
+        }
+    }, 1500);
+}
+
+function addSpawnHistory(id, request, result) {
+    spawnState.history.unshift({
+        id, request, result, ts: new Date().toLocaleTimeString(),
+    });
+    if (spawnState.history.length > 20) spawnState.history.pop();
+    const el = document.getElementById("spawn-history");
+    if (!el) return;
+    el.textContent = spawnState.history.map(h => {
+        const itemRef = h.request.item_path || h.request.item_substr;
+        const target  = h.request.chest || ("marker:" + h.request.marker);
+        const status  = h.result.status;
+        const detail  = (status === "done")
+            ? `slot ${h.result.slot}`
+            : `error: ${h.result.error || "?"}`;
+        return `[${h.ts}] ${status.padEnd(7)} ${target.slice(0, 16)}…  ${itemRef.slice(0, 40)}  x${h.request.count}  (${detail})`;
+    }).join("\n");
+}
